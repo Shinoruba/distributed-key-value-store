@@ -1,0 +1,89 @@
+version: "3.8"
+
+services:
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kvstore-node1
+    command:
+      - "--id"
+      - "node_1"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "6380"
+      - "--raft-port"
+      - "7080"
+      - "--peers"
+      - "node_2=node2:7081,node_3=node3:7082"
+      - "--wal"
+      - "/data/node1.wal"
+    ports:
+      - "6380:6380"
+    networks:
+      - kvstore-net
+    volumes:
+      - node1-data:/data
+    restart: unless-stopped
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kvstore-node2
+    command:
+      - "--id"
+      - "node_2"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "6381"
+      - "--raft-port"
+      - "7081"
+      - "--peers"
+      - "node_1=node1:7080,node_3=node3:7082"
+      - "--wal"
+      - "/data/node2.wal"
+    ports:
+      - "6381:6381"
+    networks:
+      - kvstore-net
+    volumes:
+      - node2-data:/data
+    restart: unless-stopped
+
+  node3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kvstore-node3
+    command:
+      - "--id"
+      - "node_3"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "6382"
+      - "--raft-port"
+      - "7082"
+      - "--peers"
+      - "node_1=node1:7080,node_2=node2:7081"
+      - "--wal"
+      - "/data/node3.wal"
+    ports:
+      - "6382:6382"
+    networks:
+      - kvstore-net
+    volumes:
+      - node3-data:/data
+    restart: unless-stopped
+
+networks:
+  kvstore-net:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

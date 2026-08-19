@@ -126,3 +126,42 @@ Latency Distribution:
 ```powershell
 .\build\DistributedKVStore\Release\kvstore-tests.exe
 ```
+
+---
+
+## Docker & Container Deployment
+
+### 1. Build Docker Image
+```bash
+docker build -t kvstore:latest .
+```
+
+### 2. Run 3-Node Cluster with Docker Compose
+```bash
+docker compose up -d
+```
+
+Check cluster status and logs:
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+Connect via CLI to any mapped container port (`6380`, `6381`, `6382`):
+```powershell
+.\build\DistributedKVStore\Release\kvstore-cli.exe --port 6380
+```
+
+Tear down the cluster:
+```bash
+docker compose down -v
+```
+
+---
+
+## Continuous Integration (CI)
+
+Automated multi-platform CI is configured with **GitHub Actions** (`.github/workflows/ci.yml`):
+- **Windows:** MSVC with C++17
+- **Linux:** Ubuntu GCC with C++17
+- Automatically compiles Release binaries and runs `kvstore-tests` on every push and pull request.
