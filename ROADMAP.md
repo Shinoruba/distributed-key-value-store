@@ -8,11 +8,11 @@
 - [x] Write unit tests verifying concurrent read/write isolation.
 
 ### Phase 2: Standalone Asio Networking & Protocol
-- [ ] Define the binary/text wire protocol (length-prefixed frames or RESP/JSON).
-- [ ] Implement `TcpServer` with asynchronous accept loops using standalone Asio.
-- [ ] Implement `Session` class managing per-connection reading, command dispatch, and write queues.
-- [ ] Handle client disconnections, partial reads, and malformed frames gracefully.
-- [ ] Integration test: send concurrent client requests to the server over TCP.
+- [x] Define the binary/text wire protocol (length-prefixed frames or RESP/JSON).
+- [x] Implement `TcpServer` with asynchronous accept loops using standalone Asio.
+- [x] Implement `Session` / `TcpSession` class managing per-connection reading, command dispatch, and write queues.
+- [x] Handle client disconnections, partial reads, and malformed frames gracefully.
+- [x] Integration test: send concurrent client requests to the server over TCP.
 
 ### Phase 3: Distributed Consensus & Replication
 - [ ] Define cluster membership configuration (node IDs, endpoints).

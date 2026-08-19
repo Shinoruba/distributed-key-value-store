@@ -10,9 +10,12 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <asio.hpp>
 
 #include "storage_engine.hpp"
 #include "wal.hpp"
+#include "protocol.hpp"
+#include "tcp_server.hpp"
 
 using namespace distributed_kv;
 
@@ -149,7 +152,6 @@ void test_wal_durability_and_recovery() {
         expected_state.erase("user:30");
 
         assert(engine.size() == expected_state.size());
-        // Simulating crash: objects destroyed right here
     }
 
     {
@@ -157,8 +159,8 @@ void test_wal_durability_and_recovery() {
         WAL recovery_wal(wal_path);
 
         size_t replayed = recovery_wal.recover(recovered_engine);
-        std::cout << "Replayed " << replayed << " records from WAL." << std::endl;
-
+        (void)replayed;
+        assert(replayed > 0);
         assert(recovered_engine.size() == expected_state.size());
 
         for (const auto& [k, v] : expected_state) {
@@ -187,14 +189,12 @@ void test_wal_corruption_and_truncation() {
         wal.close();
     }
 
-    // Inject corrupted bytes at the end of the WAL file
     {
         std::ofstream out(wal_path, std::ios::binary | std::ios::app);
         const char garbage[] = { '\xFF', '\x00', '\xDE', '\xAD', '\xBE', '\xEF' };
         out.write(garbage, sizeof(garbage));
     }
 
-    // Recovery must safely read valid prefix and stop without crashing on corrupted tail
     {
         StorageEngine engine;
         WAL recovery_wal(wal_path);
@@ -207,7 +207,6 @@ void test_wal_corruption_and_truncation() {
         assert(engine.get("k3").value() == "v3");
     }
 
-    // Test Truncation
     {
         WAL wal(wal_path);
         assert(wal.size_bytes() > 0);
@@ -224,6 +223,153 @@ void test_wal_corruption_and_truncation() {
 
     std::filesystem::remove_all("test_data");
     std::cout << "[PASS] WAL Corruption handling and Truncation verified successfully.\n" << std::endl;
+}
+
+void test_protocol_serialization() {
+    std::cout << "=== Running Protocol Wire Serialization Tests ===" << std::endl;
+
+    auto ping_req = Request::make_ping();
+    auto ping_bytes = Protocol::serialize_request(ping_req);
+    auto ping_parsed = Protocol::deserialize_request(ping_bytes.data() + 4, ping_bytes.size() - 4);
+    assert(ping_parsed.has_value());
+    assert(ping_parsed->op == OpCode::PING);
+
+    auto set_req = Request::make_set("user:key_99", "custom_binary_payload");
+    auto set_bytes = Protocol::serialize_request(set_req);
+    auto set_parsed = Protocol::deserialize_request(set_bytes.data() + 4, set_bytes.size() - 4);
+    assert(set_parsed.has_value());
+    assert(set_parsed->op == OpCode::SET);
+    assert(set_parsed->key == "user:key_99");
+    assert(set_parsed->value == "custom_binary_payload");
+
+    auto get_req = Request::make_get("my_key");
+    auto get_bytes = Protocol::serialize_request(get_req);
+    auto get_parsed = Protocol::deserialize_request(get_bytes.data() + 4, get_bytes.size() - 4);
+    assert(get_parsed.has_value() && get_parsed->op == OpCode::GET && get_parsed->key == "my_key");
+
+    auto res_ok = Response::ok("hello_world", "OK");
+    auto res_ok_bytes = Protocol::serialize_response(res_ok);
+    auto res_ok_parsed = Protocol::deserialize_response(res_ok_bytes.data() + 4, res_ok_bytes.size() - 4);
+    assert(res_ok_parsed.has_value());
+    assert(res_ok_parsed->status == StatusCode::OK);
+    assert(res_ok_parsed->value == "hello_world");
+    assert(res_ok_parsed->message == "OK");
+
+    auto res_nf = Response::not_found("No such item");
+    auto res_nf_bytes = Protocol::serialize_response(res_nf);
+    auto res_nf_parsed = Protocol::deserialize_response(res_nf_bytes.data() + 4, res_nf_bytes.size() - 4);
+    assert(res_nf_parsed.has_value());
+    assert(res_nf_parsed->status == StatusCode::NOT_FOUND);
+    assert(res_nf_parsed->message == "No such item");
+
+    std::cout << "[PASS] Protocol serialization & deserialization verified.\n" << std::endl;
+}
+
+static Response send_request_sync(asio::ip::tcp::socket& sock, const Request& req) {
+    auto req_data = Protocol::serialize_request(req);
+    asio::write(sock, asio::buffer(req_data));
+
+    uint32_t payload_len = 0;
+    asio::read(sock, asio::buffer(&payload_len, sizeof(uint32_t)));
+
+    std::vector<uint8_t> payload(payload_len);
+    asio::read(sock, asio::buffer(payload.data(), payload_len));
+
+    auto res = Protocol::deserialize_response(payload.data(), payload.size());
+    assert(res.has_value());
+    return *res;
+}
+
+void test_tcp_server_async_multiclient() {
+    std::cout << "=== Running Async TCP Server Multi-Client Integration Test ===" << std::endl;
+
+    StorageEngine engine;
+    asio::io_context ioc;
+
+    TcpServer server(ioc, 0, engine);
+    server.start();
+
+    uint16_t port = server.port();
+    assert(port != 0);
+    std::cout << "TcpServer listening on 127.0.0.1:" << port << std::endl;
+
+    const int NUM_WORKER_THREADS = 4;
+    std::vector<std::thread> workers;
+    workers.reserve(NUM_WORKER_THREADS);
+    for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
+        workers.emplace_back([&ioc]() {
+            ioc.run();
+        });
+    }
+
+    const int NUM_CLIENTS = 8;
+    const int REQUESTS_PER_CLIENT = 200;
+    std::atomic<uint64_t> successful_ops{0};
+    std::vector<std::thread> client_threads;
+    client_threads.reserve(NUM_CLIENTS);
+
+    for (int c = 0; c < NUM_CLIENTS; ++c) {
+        client_threads.emplace_back([&, c, port]() {
+            try {
+                asio::io_context client_ioc;
+                asio::ip::tcp::socket sock(client_ioc);
+                sock.connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+
+                auto ping_res = send_request_sync(sock, Request::make_ping());
+                assert(ping_res.status == StatusCode::OK);
+                assert(ping_res.value == "PONG");
+                successful_ops.fetch_add(1, std::memory_order_relaxed);
+
+                for (int i = 0; i < REQUESTS_PER_CLIENT; ++i) {
+                    std::string key = "client_" + std::to_string(c) + "_key_" + std::to_string(i);
+                    std::string val = "val_" + std::to_string(c) + "_" + std::to_string(i);
+
+                    auto set_res = send_request_sync(sock, Request::make_set(key, val));
+                    assert(set_res.status == StatusCode::OK);
+                    successful_ops.fetch_add(1, std::memory_order_relaxed);
+
+                    auto get_res = send_request_sync(sock, Request::make_get(key));
+                    assert(get_res.status == StatusCode::OK);
+                    assert(get_res.value == val);
+                    successful_ops.fetch_add(1, std::memory_order_relaxed);
+
+                    if (i % 2 == 0) {
+                        auto del_res = send_request_sync(sock, Request::make_del(key));
+                        assert(del_res.status == StatusCode::OK);
+                        successful_ops.fetch_add(1, std::memory_order_relaxed);
+
+                        auto get_after_del = send_request_sync(sock, Request::make_get(key));
+                        assert(get_after_del.status == StatusCode::NOT_FOUND);
+                        successful_ops.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+
+                auto stats_res = send_request_sync(sock, Request::make_stats());
+                assert(stats_res.status == StatusCode::OK);
+                successful_ops.fetch_add(1, std::memory_order_relaxed);
+
+                sock.close();
+            } catch (const std::exception& ex) {
+                std::cerr << "Client error: " << ex.what() << std::endl;
+                assert(false);
+            }
+        });
+    }
+
+    for (auto& t : client_threads) {
+        t.join();
+    }
+
+    std::cout << "All " << NUM_CLIENTS << " clients completed successfully. Total TCP operations: " << successful_ops.load() << std::endl;
+
+    server.stop();
+    ioc.stop();
+
+    for (auto& w : workers) {
+        w.join();
+    }
+
+    std::cout << "[PASS] Async TCP Server Multi-Client integration tests passed.\n" << std::endl;
 }
 
 void test_concurrency_stress() {
@@ -348,6 +494,8 @@ int main() {
         test_state_machine_batching_and_snapshot();
         test_wal_durability_and_recovery();
         test_wal_corruption_and_truncation();
+        test_protocol_serialization();
+        test_tcp_server_async_multiclient();
         test_concurrency_stress();
 
         std::cout << "=================================================" << std::endl;

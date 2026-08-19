@@ -7,12 +7,20 @@ add_executable(DistributedKVStore
     "include/storage_engine.hpp"
     "src/wal.cpp"
     "include/wal.hpp"
+    "src/protocol.cpp"
+    "include/protocol.hpp"
+    "src/tcp_session.cpp"
+    "include/tcp_session.hpp"
+    "src/tcp_server.cpp"
+    "include/tcp_server.hpp"
 )
 
 target_include_directories(DistributedKVStore PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
+
+target_link_libraries(DistributedKVStore PRIVATE asio)
 
 target_compile_features(DistributedKVStore PUBLIC cxx_std_17)
 
