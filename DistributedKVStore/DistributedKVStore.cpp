@@ -657,6 +657,115 @@ void test_raft_log_replication_and_catchup() {
     std::cout << "[PASS] Raft Log Replication, Quorum Commit & Catch-Up tests passed.\n" << std::endl;
 }
 
+void test_raft_snapshot_compaction_and_install() {
+    std::cout << "=== Running Raft Snapshot Compaction & InstallSnapshot Test ===" << std::endl;
+
+    asio::io_context ioc;
+    StorageEngine engine1, engine2, engine3;
+
+    auto node1 = std::make_shared<RaftNode>("node_1", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine1);
+    auto node2 = std::make_shared<RaftNode>("node_2", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine2);
+    auto node3 = std::make_shared<RaftNode>("node_3", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine3);
+
+    node1->set_peers({{"node_2", "127.0.0.1", node2->port()}, {"node_3", "127.0.0.1", node3->port()}});
+    node2->set_peers({{"node_1", "127.0.0.1", node1->port()}, {"node_3", "127.0.0.1", node3->port()}});
+    node3->set_peers({{"node_1", "127.0.0.1", node1->port()}, {"node_2", "127.0.0.1", node2->port()}});
+
+    node1->start();
+    node2->start();
+    node3->start();
+
+    const int NUM_WORKER_THREADS = 4;
+    std::vector<std::thread> workers;
+    workers.reserve(NUM_WORKER_THREADS);
+    for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
+        workers.emplace_back([&ioc]() {
+            ioc.run();
+        });
+    }
+
+    std::shared_ptr<RaftNode> leader = nullptr;
+    for (int retry = 0; retry < 40; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (node1->is_leader()) leader = node1;
+        else if (node2->is_leader()) leader = node2;
+        else if (node3->is_leader()) leader = node3;
+        if (leader) break;
+    }
+    assert(leader != nullptr);
+    std::cout << "Leader for snapshot test: " << leader->node_id() << std::endl;
+
+    // 1. Propose 200 items
+    for (int i = 0; i < 200; ++i) {
+        std::string key = "snap_k" + std::to_string(i);
+        std::string val = "snap_v" + std::to_string(i);
+        bool ok = leader->propose(Command::make_set(key, val));
+        (void)ok;
+        assert(ok);
+    }
+    std::cout << "Committed 200 initial entries across cluster." << std::endl;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // 2. Identify a follower to simulate severe lag (stop it before compaction)
+    std::shared_ptr<RaftNode> lagging_follower = (node1 != leader ? node1 : node2);
+    StorageEngine& lagging_eng = (lagging_follower == node1 ? engine1 : engine2);
+
+    std::cout << "Stopping follower " << lagging_follower->node_id() << " before snapshot..." << std::endl;
+    lagging_follower->stop();
+
+    // 3. Compact log on leader up to index 150
+    std::cout << "Leader taking snapshot and compacting log up to index 150..." << std::endl;
+    bool snap_ok = leader->take_snapshot(150);
+    (void)snap_ok;
+    assert(snap_ok);
+    assert(leader->last_included_index() == 150);
+    assert(leader->in_memory_log_size() <= 55);
+    std::cout << "Leader in-memory log successfully compacted to " << leader->in_memory_log_size() << " entries." << std::endl;
+
+    // 4. Propose 50 more items while follower is still down
+    for (int i = 200; i < 250; ++i) {
+        std::string key = "snap_k" + std::to_string(i);
+        std::string val = "snap_v" + std::to_string(i);
+        bool ok = leader->propose(Command::make_set(key, val));
+        (void)ok;
+        assert(ok);
+    }
+
+    // 5. Restart the lagging follower; leader must stream snapshot via InstallSnapshot RPC
+    std::cout << "Restarting lagging follower " << lagging_follower->node_id() << " to trigger InstallSnapshot..." << std::endl;
+    lagging_follower->start();
+
+    // Wait for lagging follower to install snapshot and catch up to 250 entries
+    for (int retry = 0; retry < 60; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (lagging_eng.size() == 250) {
+            break;
+        }
+    }
+
+    assert(lagging_eng.size() == 250);
+    for (int i = 0; i < 250; ++i) {
+        std::string key = "snap_k" + std::to_string(i);
+        std::string val = "snap_v" + std::to_string(i);
+        assert(lagging_eng.get(key).value() == val);
+    }
+
+    std::cout << "Lagging follower successfully installed snapshot and caught up to 250 entries!" << std::endl;
+
+    // Teardown
+    node1->stop();
+    node2->stop();
+    node3->stop();
+    ioc.stop();
+
+    for (auto& w : workers) {
+        w.join();
+    }
+
+    std::cout << "[PASS] Raft Snapshot Compaction & InstallSnapshot tests passed.\n" << std::endl;
+}
+
 void test_concurrency_stress() {
     std::cout << "=== Running Multi-Threaded Concurrency Stress Test ===" << std::endl;
 
@@ -784,6 +893,7 @@ int main() {
         test_raft_rpc_serialization();
         test_raft_3node_cluster_leader_election_and_failover();
         test_raft_log_replication_and_catchup();
+        test_raft_snapshot_compaction_and_install();
         test_concurrency_stress();
 
         std::cout << "=================================================" << std::endl;

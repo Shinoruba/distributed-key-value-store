@@ -287,4 +287,143 @@ std::optional<AppendEntriesReply> RaftRpcSerializer::deserialize_append_entries_
     return reply;
 }
 
+std::vector<uint8_t> RaftRpcSerializer::serialize_install_snapshot_args(const InstallSnapshotArgs& args) {
+    const uint32_t lid_len = static_cast<uint32_t>(args.leader_id.size());
+    const uint32_t num_pairs = static_cast<uint32_t>(args.data.size());
+
+    uint32_t payload_len = sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) + lid_len +
+                           sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
+
+    for (const auto& [k, v] : args.data) {
+        payload_len += sizeof(uint32_t) + static_cast<uint32_t>(k.size()) +
+                       sizeof(uint32_t) + static_cast<uint32_t>(v.size());
+    }
+
+    std::vector<uint8_t> buffer;
+    buffer.reserve(sizeof(uint32_t) + payload_len);
+
+    const uint8_t* p_len = reinterpret_cast<const uint8_t*>(&payload_len);
+    buffer.insert(buffer.end(), p_len, p_len + sizeof(uint32_t));
+
+    buffer.push_back(static_cast<uint8_t>(RaftRpcType::INSTALL_SNAPSHOT_REQ));
+
+    const uint8_t* term_bytes = reinterpret_cast<const uint8_t*>(&args.term);
+    buffer.insert(buffer.end(), term_bytes, term_bytes + sizeof(uint64_t));
+
+    const uint8_t* lid_len_bytes = reinterpret_cast<const uint8_t*>(&lid_len);
+    buffer.insert(buffer.end(), lid_len_bytes, lid_len_bytes + sizeof(uint32_t));
+    buffer.insert(buffer.end(), args.leader_id.begin(), args.leader_id.end());
+
+    const uint8_t* last_idx_bytes = reinterpret_cast<const uint8_t*>(&args.last_included_index);
+    buffer.insert(buffer.end(), last_idx_bytes, last_idx_bytes + sizeof(uint64_t));
+
+    const uint8_t* last_term_bytes = reinterpret_cast<const uint8_t*>(&args.last_included_term);
+    buffer.insert(buffer.end(), last_term_bytes, last_term_bytes + sizeof(uint64_t));
+
+    const uint8_t* num_pairs_bytes = reinterpret_cast<const uint8_t*>(&num_pairs);
+    buffer.insert(buffer.end(), num_pairs_bytes, num_pairs_bytes + sizeof(uint32_t));
+
+    for (const auto& [k, v] : args.data) {
+        uint32_t k_len = static_cast<uint32_t>(k.size());
+        const uint8_t* k_len_bytes = reinterpret_cast<const uint8_t*>(&k_len);
+        buffer.insert(buffer.end(), k_len_bytes, k_len_bytes + sizeof(uint32_t));
+        buffer.insert(buffer.end(), k.begin(), k.end());
+
+        uint32_t v_len = static_cast<uint32_t>(v.size());
+        const uint8_t* v_len_bytes = reinterpret_cast<const uint8_t*>(&v_len);
+        buffer.insert(buffer.end(), v_len_bytes, v_len_bytes + sizeof(uint32_t));
+        buffer.insert(buffer.end(), v.begin(), v.end());
+    }
+
+    return buffer;
+}
+
+std::optional<InstallSnapshotArgs> RaftRpcSerializer::deserialize_install_snapshot_args(const uint8_t* data, size_t size) {
+    if (size < sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t)) {
+        return std::nullopt;
+    }
+    if (data[0] != static_cast<uint8_t>(RaftRpcType::INSTALL_SNAPSHOT_REQ)) {
+        return std::nullopt;
+    }
+
+    InstallSnapshotArgs args;
+    size_t offset = 1;
+
+    args.term = *reinterpret_cast<const uint64_t*>(data + offset);
+    offset += sizeof(uint64_t);
+
+    uint32_t lid_len = *reinterpret_cast<const uint32_t*>(data + offset);
+    offset += sizeof(uint32_t);
+
+    if (offset + lid_len + sizeof(uint64_t) * 2 + sizeof(uint32_t) > size) {
+        return std::nullopt;
+    }
+
+    args.leader_id.assign(reinterpret_cast<const char*>(data + offset), lid_len);
+    offset += lid_len;
+
+    args.last_included_index = *reinterpret_cast<const uint64_t*>(data + offset);
+    offset += sizeof(uint64_t);
+
+    args.last_included_term = *reinterpret_cast<const uint64_t*>(data + offset);
+    offset += sizeof(uint64_t);
+
+    uint32_t num_pairs = *reinterpret_cast<const uint32_t*>(data + offset);
+    offset += sizeof(uint32_t);
+
+    for (uint32_t i = 0; i < num_pairs; ++i) {
+        if (offset + sizeof(uint32_t) > size) return std::nullopt;
+        uint32_t k_len = *reinterpret_cast<const uint32_t*>(data + offset);
+        offset += sizeof(uint32_t);
+
+        if (offset + k_len + sizeof(uint32_t) > size) return std::nullopt;
+        std::string k(reinterpret_cast<const char*>(data + offset), k_len);
+        offset += k_len;
+
+        uint32_t v_len = *reinterpret_cast<const uint32_t*>(data + offset);
+        offset += sizeof(uint32_t);
+
+        if (offset + v_len > size) return std::nullopt;
+        std::string v(reinterpret_cast<const char*>(data + offset), v_len);
+        offset += v_len;
+
+        args.data.emplace(std::move(k), std::move(v));
+    }
+
+    return args;
+}
+
+std::vector<uint8_t> RaftRpcSerializer::serialize_install_snapshot_reply(const InstallSnapshotReply& reply) {
+    const uint32_t payload_len = sizeof(uint8_t) + sizeof(uint64_t);
+
+    std::vector<uint8_t> buffer;
+    buffer.reserve(sizeof(uint32_t) + payload_len);
+
+    const uint8_t* p_len = reinterpret_cast<const uint8_t*>(&payload_len);
+    buffer.insert(buffer.end(), p_len, p_len + sizeof(uint32_t));
+
+    buffer.push_back(static_cast<uint8_t>(RaftRpcType::INSTALL_SNAPSHOT_RESP));
+
+    const uint8_t* term_bytes = reinterpret_cast<const uint8_t*>(&reply.term);
+    buffer.insert(buffer.end(), term_bytes, term_bytes + sizeof(uint64_t));
+
+    return buffer;
+}
+
+std::optional<InstallSnapshotReply> RaftRpcSerializer::deserialize_install_snapshot_reply(const uint8_t* data, size_t size) {
+    if (size < sizeof(uint8_t) + sizeof(uint64_t)) {
+        return std::nullopt;
+    }
+    if (data[0] != static_cast<uint8_t>(RaftRpcType::INSTALL_SNAPSHOT_RESP)) {
+        return std::nullopt;
+    }
+
+    InstallSnapshotReply reply;
+    size_t offset = 1;
+
+    reply.term = *reinterpret_cast<const uint64_t*>(data + offset);
+
+    return reply;
+}
+
 } // namespace distributed_kv

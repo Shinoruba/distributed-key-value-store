@@ -22,7 +22,7 @@
 - [x] Add client forwarding (redirect non-leader writes to current leader).
 
 ### Phase 4: Fault Tolerance, Compaction & Tooling
-- [ ] Implement Log Compaction and Snapshotting to limit WAL growth.
-- [ ] Handle network partitions and node re-joins with catch-up synchronization.
+- [x] Implement Log Compaction and Snapshotting to limit WAL growth.
+- [x] Handle network partitions and node re-joins with catch-up synchronization.
 - [ ] Build a lightweight CLI client utility for interacting with the cluster.
 - [ ] Benchmark throughput and p99 latency under concurrent workloads.

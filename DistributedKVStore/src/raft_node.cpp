@@ -19,7 +19,6 @@ RaftNode::RaftNode(NodeId node_id, std::string host, uint16_t port,
       election_timer_(ioc),
       heartbeat_timer_(ioc),
       rng_(std::random_device{}() + std::hash<std::string>{}(node_id_)) {
-    // Index 0 dummy entry
     log_.push_back(LogEntry{0, 0, Command::make_noop()});
 
     asio::error_code ec;
