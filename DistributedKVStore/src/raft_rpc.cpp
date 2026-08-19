@@ -112,7 +112,8 @@ std::vector<uint8_t> RaftRpcSerializer::serialize_append_entries_args(const Appe
     for (const auto& entry : args.entries) {
         payload_len += sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint8_t) +
                        sizeof(uint32_t) + static_cast<uint32_t>(entry.command.key.size()) +
-                       sizeof(uint32_t) + static_cast<uint32_t>(entry.command.value.size());
+                       sizeof(uint32_t) + static_cast<uint32_t>(entry.command.value.size()) +
+                       sizeof(uint64_t);
     }
 
     std::vector<uint8_t> buffer;
@@ -160,6 +161,9 @@ std::vector<uint8_t> RaftRpcSerializer::serialize_append_entries_args(const Appe
         const uint8_t* v_len_bytes = reinterpret_cast<const uint8_t*>(&v_len);
         buffer.insert(buffer.end(), v_len_bytes, v_len_bytes + sizeof(uint32_t));
         buffer.insert(buffer.end(), entry.command.value.begin(), entry.command.value.end());
+
+        const uint8_t* ttl_bytes = reinterpret_cast<const uint8_t*>(&entry.command.ttl_ms);
+        buffer.insert(buffer.end(), ttl_bytes, ttl_bytes + sizeof(uint64_t));
     }
 
     return buffer;
@@ -236,6 +240,11 @@ std::optional<AppendEntriesArgs> RaftRpcSerializer::deserialize_append_entries_a
 
         entry.command.value.assign(reinterpret_cast<const char*>(data + offset), v_len);
         offset += v_len;
+
+        if (offset + sizeof(uint64_t) <= size) {
+            entry.command.ttl_ms = *reinterpret_cast<const uint64_t*>(data + offset);
+            offset += sizeof(uint64_t);
+        }
 
         args.entries.push_back(std::move(entry));
     }

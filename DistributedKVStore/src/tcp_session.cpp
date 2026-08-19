@@ -79,7 +79,7 @@ void TcpSession::handle_request(const Request& req) {
                     queue_response(Response::error("NOT_LEADER:" + raft_->leader_id()));
                     return;
                 }
-                raft_->propose(Command::make_set(req.key, req.value), [self](bool ok, std::string leader_id) {
+                raft_->propose(Command::make_set(req.key, req.value, req.ttl_ms), [self](bool ok, std::string leader_id) {
                     if (ok) {
                         self->queue_response(Response::ok("", "OK"));
                     } else {
@@ -87,7 +87,7 @@ void TcpSession::handle_request(const Request& req) {
                     }
                 });
             } else {
-                engine_.set(req.key, req.value);
+                engine_.set(req.key, req.value, req.ttl_ms > 0 ? std::optional<uint64_t>(req.ttl_ms) : std::nullopt);
                 queue_response(Response::ok("", "OK"));
             }
             break;
@@ -127,6 +127,12 @@ void TcpSession::handle_request(const Request& req) {
 
         case OpCode::STATS: {
             queue_response(Response::ok(std::to_string(engine_.size()), "OK"));
+            break;
+        }
+
+        case OpCode::TTL: {
+            int64_t rem_ms = engine_.ttl(req.key);
+            queue_response(Response::ok(std::to_string(rem_ms), "OK"));
             break;
         }
 

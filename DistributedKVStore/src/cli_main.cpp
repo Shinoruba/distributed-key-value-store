@@ -27,7 +27,8 @@ static void print_usage(const char* prog) {
               << "  --help             Show help message\n\n"
               << "Examples:\n"
               << "  " << prog << "                             # Starts interactive REPL\n"
-              << "  " << prog << " SET mykey hello_world      # One-shot command\n"
+              << "  " << prog << " SET mykey hello EX 10      # One-shot command with 10s TTL\n"
+              << "  " << prog << " TTL mykey\n"
               << "  " << prog << " GET mykey\n";
 }
 
@@ -76,7 +77,7 @@ static ExecutionResult send_command(asio::ip::tcp::socket& sock, const Request& 
     return result;
 }
 
-static void print_result(const ExecutionResult& res) {
+static void print_result(const ExecutionResult& res, bool is_ttl_cmd = false) {
     if (!res.success) {
         std::cout << COLOR_RED << "(error) " << res.error_message << COLOR_RESET << std::endl;
         return;
@@ -94,7 +95,20 @@ static void print_result(const ExecutionResult& res) {
     }
 
     if (res.response.status == StatusCode::OK) {
-        if (!res.response.value.empty()) {
+        if (is_ttl_cmd) {
+            try {
+                int64_t val = std::stoll(res.response.value);
+                if (val == -1) {
+                    std::cout << COLOR_GREEN << "(integer) -1 (no expiration)" << COLOR_RESET;
+                } else if (val == -2) {
+                    std::cout << COLOR_YELLOW << "(integer) -2 (key does not exist or expired)" << COLOR_RESET;
+                } else {
+                    std::cout << COLOR_GREEN << "(integer) " << val << " ms (" << (val / 1000) << "s remaining)" << COLOR_RESET;
+                }
+            } catch (...) {
+                std::cout << COLOR_GREEN << res.response.value << COLOR_RESET;
+            }
+        } else if (!res.response.value.empty()) {
             std::cout << COLOR_GREEN << "\"" << res.response.value << "\"" << COLOR_RESET;
         } else {
             std::cout << COLOR_GREEN << "OK" << COLOR_RESET;
@@ -122,6 +136,35 @@ static std::vector<std::string> tokenize_line(const std::string& line) {
         tokens.push_back(token);
     }
     return tokens;
+}
+
+static bool parse_set_command(const std::vector<std::string>& tokens, std::string& key, std::string& val, uint64_t& ttl_ms) {
+    if (tokens.size() < 3) return false;
+    key = tokens[1];
+    ttl_ms = 0;
+
+    size_t val_end = tokens.size();
+    for (size_t i = 2; i < tokens.size(); ++i) {
+        std::string opt = tokens[i];
+        for (auto& c : opt) c = static_cast<char>(std::toupper(c));
+
+        if (opt == "EX" && i + 1 < tokens.size()) {
+            ttl_ms = static_cast<uint64_t>(std::stoull(tokens[i + 1])) * 1000;
+            val_end = i;
+            break;
+        } else if (opt == "PX" && i + 1 < tokens.size()) {
+            ttl_ms = static_cast<uint64_t>(std::stoull(tokens[i + 1]));
+            val_end = i;
+            break;
+        }
+    }
+
+    val.clear();
+    for (size_t i = 2; i < val_end; ++i) {
+        if (i > 2) val += " ";
+        val += tokens[i];
+    }
+    return !val.empty();
 }
 
 int main(int argc, char* argv[]) {
@@ -171,17 +214,20 @@ int main(int argc, char* argv[]) {
 
         if (op == "PING") {
             print_result(send_command(socket, Request::make_ping()));
-        } else if (op == "SET" && cmd_args.size() >= 3) {
-            std::string val;
-            for (size_t i = 2; i < cmd_args.size(); ++i) {
-                if (i > 2) val += " ";
-                val += cmd_args[i];
+        } else if (op == "SET") {
+            std::string key, val;
+            uint64_t ttl_ms = 0;
+            if (!parse_set_command(cmd_args, key, val, ttl_ms)) {
+                std::cerr << COLOR_RED << "Syntax: SET <key> <val> [EX seconds | PX ms]" << COLOR_RESET << std::endl;
+                return 1;
             }
-            print_result(send_command(socket, Request::make_set(cmd_args[1], val)));
+            print_result(send_command(socket, Request::make_set(key, val, ttl_ms)));
         } else if (op == "GET" && cmd_args.size() >= 2) {
             print_result(send_command(socket, Request::make_get(cmd_args[1])));
         } else if (op == "DEL" && cmd_args.size() >= 2) {
             print_result(send_command(socket, Request::make_del(cmd_args[1])));
+        } else if (op == "TTL" && cmd_args.size() >= 2) {
+            print_result(send_command(socket, Request::make_ttl(cmd_args[1])), true);
         } else if (op == "STATS") {
             print_result(send_command(socket, Request::make_stats()));
         } else {
@@ -218,28 +264,26 @@ int main(int argc, char* argv[]) {
 
         if (cmd == "HELP") {
             std::cout << COLOR_BOLD << "Commands:\n" << COLOR_RESET
-                      << "  PING                   - Check server liveness\n"
-                      << "  SET <key> <value>      - Set key to value (Raft replicated)\n"
-                      << "  GET <key>              - Retrieve value by key\n"
-                      << "  DEL <key>              - Delete key (Raft replicated)\n"
-                      << "  STATS                  - Show total stored keys\n"
-                      << "  EXIT / QUIT            - Exit CLI\n";
+                      << "  PING                            - Check server liveness\n"
+                      << "  SET <key> <val> [EX s | PX ms]  - Set key to value with optional TTL\n"
+                      << "  GET <key>                       - Retrieve value by key\n"
+                      << "  DEL <key>                       - Delete key\n"
+                      << "  TTL <key>                       - Check remaining TTL in milliseconds\n"
+                      << "  STATS                           - Show total stored keys\n"
+                      << "  EXIT / QUIT                     - Exit CLI\n";
             continue;
         }
 
         if (cmd == "PING") {
             print_result(send_command(socket, Request::make_ping()));
         } else if (cmd == "SET") {
-            if (tokens.size() < 3) {
-                std::cout << COLOR_RED << "(error) Syntax: SET <key> <value>" << COLOR_RESET << std::endl;
+            std::string key, val;
+            uint64_t ttl_ms = 0;
+            if (!parse_set_command(tokens, key, val, ttl_ms)) {
+                std::cout << COLOR_RED << "(error) Syntax: SET <key> <value> [EX seconds | PX ms]" << COLOR_RESET << std::endl;
                 continue;
             }
-            std::string val;
-            for (size_t i = 2; i < tokens.size(); ++i) {
-                if (i > 2) val += " ";
-                val += tokens[i];
-            }
-            print_result(send_command(socket, Request::make_set(tokens[1], val)));
+            print_result(send_command(socket, Request::make_set(key, val, ttl_ms)));
         } else if (cmd == "GET") {
             if (tokens.size() < 2) {
                 std::cout << COLOR_RED << "(error) Syntax: GET <key>" << COLOR_RESET << std::endl;
@@ -252,6 +296,12 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             print_result(send_command(socket, Request::make_del(tokens[1])));
+        } else if (cmd == "TTL") {
+            if (tokens.size() < 2) {
+                std::cout << COLOR_RED << "(error) Syntax: TTL <key>" << COLOR_RESET << std::endl;
+                continue;
+            }
+            print_result(send_command(socket, Request::make_ttl(tokens[1])), true);
         } else if (cmd == "STATS") {
             print_result(send_command(socket, Request::make_stats()));
         } else {

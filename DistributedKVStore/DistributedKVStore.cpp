@@ -62,6 +62,61 @@ void test_basic_crud() {
     std::cout << "[PASS] Basic CRUD tests passed successfully.\n" << std::endl;
 }
 
+void test_ttl_expiration_and_eviction() {
+    std::cout << "=== Running TTL Expiration & Eviction Tests ===" << std::endl;
+    StorageEngine engine;
+
+    engine.set("persistent_key", "val1");
+    engine.set("expiring_key", "val2", 50);
+
+    assert(engine.ttl("persistent_key") == -1);
+    assert(engine.ttl("non_existent") == -2);
+    int64_t rem = engine.ttl("expiring_key");
+    assert(rem > 0 && rem <= 50);
+
+    assert(engine.get("expiring_key").has_value());
+    assert(engine.exists("expiring_key"));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    assert(engine.ttl("expiring_key") == -2);
+    assert(!engine.exists("expiring_key"));
+    assert(!engine.get("expiring_key").has_value());
+    assert(engine.size() == 1);
+
+    for (int i = 0; i < 50; ++i) {
+        engine.set("temp_" + std::to_string(i), "temp_val", 30);
+    }
+    assert(engine.size() == 51);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    size_t purged = engine.purge_expired(100);
+    assert(purged == 50);
+    assert(engine.size() == 1);
+    assert(engine.get("persistent_key").value() == "val1");
+
+    std::filesystem::path wal_path = "test_data/wal_ttl.log";
+    std::filesystem::remove(wal_path);
+    {
+        auto wal = std::make_shared<WAL>(wal_path);
+        StorageEngine wal_engine(wal);
+        wal_engine.set("wal_perm", "permanent");
+        wal_engine.set("wal_temp", "temporary", 5000);
+    }
+
+    {
+        StorageEngine recovered_engine;
+        WAL recovery_wal(wal_path);
+        recovery_wal.recover(recovered_engine);
+        assert(recovered_engine.size() == 2);
+        assert(recovered_engine.ttl("wal_perm") == -1);
+        int64_t wal_rem = recovered_engine.ttl("wal_temp");
+        assert(wal_rem > 0 && wal_rem <= 5000);
+    }
+    std::filesystem::remove_all("test_data");
+
+    std::cout << "[PASS] TTL Expiration & Eviction tests passed.\n" << std::endl;
+}
+
 void test_state_machine_batching_and_snapshot() {
     std::cout << "=== Running State Machine & Batching Tests ===" << std::endl;
     StorageEngine engine;
@@ -885,6 +940,7 @@ int main() {
 
     try {
         test_basic_crud();
+        test_ttl_expiration_and_eviction();
         test_state_machine_batching_and_snapshot();
         test_wal_durability_and_recovery();
         test_wal_corruption_and_truncation();

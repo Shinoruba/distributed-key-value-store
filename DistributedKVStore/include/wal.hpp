@@ -24,6 +24,7 @@ struct WALRecord {
     WALRecordType type{WALRecordType::NOOP};
     std::string key;
     std::string value;
+    uint64_t ttl_ms{0};
 };
 
 class CRC32 {
@@ -43,10 +44,10 @@ public:
     WAL(WAL&& other) noexcept;
     WAL& operator=(WAL&& other) noexcept;
 
-    bool append_set(std::string_view key, std::string_view value);
+    bool append_set(std::string_view key, std::string_view value, uint64_t ttl_ms = 0);
     bool append_del(std::string_view key);
     bool append_clear();
-    bool append(WALRecordType type, std::string_view key, std::string_view value);
+    bool append(WALRecordType type, std::string_view key, std::string_view value, uint64_t ttl_ms = 0);
     bool append_batch(const std::vector<WALRecord>& records);
 
     void flush();
@@ -62,7 +63,7 @@ public:
 
 private:
     void open_writer();
-    bool write_record_unlocked(WALRecordType type, std::string_view key, std::string_view value);
+    bool write_record_unlocked(WALRecordType type, std::string_view key, std::string_view value, uint64_t ttl_ms = 0);
 
     std::filesystem::path path_;
     bool auto_flush_{true};

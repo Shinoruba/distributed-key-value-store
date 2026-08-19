@@ -4,6 +4,7 @@
 #include <memory>
 #include <sstream>
 #include <thread>
+#include <functional>
 #include <asio.hpp>
 
 #include "storage_engine.hpp"
@@ -110,9 +111,22 @@ int main(int argc, char* argv[]) {
 
         std::cout << "[Server] Ready and listening for client connections on " << host << ":" << client_port << std::endl;
 
+        asio::steady_timer sweep_timer(ioc);
+        std::function<void(const asio::error_code&)> run_sweep;
+        run_sweep = [&](const asio::error_code& ec) {
+            if (!ec) {
+                engine.purge_expired(100);
+                sweep_timer.expires_after(std::chrono::milliseconds(100));
+                sweep_timer.async_wait(run_sweep);
+            }
+        };
+        sweep_timer.expires_after(std::chrono::milliseconds(100));
+        sweep_timer.async_wait(run_sweep);
+
         asio::signal_set signals(ioc, SIGINT, SIGTERM);
         signals.async_wait([&](const asio::error_code&, int sig) {
             std::cout << "\n[Signal " << sig << " received] Initiating graceful shutdown..." << std::endl;
+            sweep_timer.cancel();
             server.stop();
             raft->stop();
             ioc.stop();

@@ -114,14 +114,14 @@ void WAL::truncate() {
     open_writer();
 }
 
-bool WAL::write_record_unlocked(WALRecordType type, std::string_view key, std::string_view value) {
+bool WAL::write_record_unlocked(WALRecordType type, std::string_view key, std::string_view value, uint64_t ttl_ms) {
     if (!writer_.is_open()) {
         return false;
     }
 
     const uint32_t key_len = static_cast<uint32_t>(key.size());
     const uint32_t val_len = static_cast<uint32_t>(value.size());
-    const uint32_t payload_len = sizeof(uint8_t) + sizeof(uint32_t) + key_len + sizeof(uint32_t) + val_len;
+    const uint32_t payload_len = sizeof(uint8_t) + sizeof(uint32_t) + key_len + sizeof(uint32_t) + val_len + sizeof(uint64_t);
 
     std::vector<uint8_t> payload;
     payload.reserve(payload_len);
@@ -136,6 +136,9 @@ bool WAL::write_record_unlocked(WALRecordType type, std::string_view key, std::s
     payload.insert(payload.end(), val_len_bytes, val_len_bytes + sizeof(uint32_t));
     payload.insert(payload.end(), value.begin(), value.end());
 
+    const uint8_t* ttl_bytes = reinterpret_cast<const uint8_t*>(&ttl_ms);
+    payload.insert(payload.end(), ttl_bytes, ttl_bytes + sizeof(uint64_t));
+
     const uint32_t checksum = CRC32::calculate(payload.data(), payload.size());
 
     writer_.write(reinterpret_cast<const char*>(&payload_len), sizeof(uint32_t));
@@ -149,8 +152,8 @@ bool WAL::write_record_unlocked(WALRecordType type, std::string_view key, std::s
     return writer_.good();
 }
 
-bool WAL::append_set(std::string_view key, std::string_view value) {
-    return append(WALRecordType::SET, key, value);
+bool WAL::append_set(std::string_view key, std::string_view value, uint64_t ttl_ms) {
+    return append(WALRecordType::SET, key, value, ttl_ms);
 }
 
 bool WAL::append_del(std::string_view key) {
@@ -161,15 +164,15 @@ bool WAL::append_clear() {
     return append(WALRecordType::CLEAR, "", "");
 }
 
-bool WAL::append(WALRecordType type, std::string_view key, std::string_view value) {
+bool WAL::append(WALRecordType type, std::string_view key, std::string_view value, uint64_t ttl_ms) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return write_record_unlocked(type, key, value);
+    return write_record_unlocked(type, key, value, ttl_ms);
 }
 
 bool WAL::append_batch(const std::vector<WALRecord>& records) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& rec : records) {
-        if (!write_record_unlocked(rec.type, rec.key, rec.value)) {
+        if (!write_record_unlocked(rec.type, rec.key, rec.value, rec.ttl_ms)) {
             return false;
         }
     }
@@ -240,10 +243,16 @@ size_t WAL::recover(StorageEngine& engine) {
 
         if (offset + val_len > payload_len) break;
         std::string value(reinterpret_cast<const char*>(payload_buffer.data() + offset), val_len);
+        offset += val_len;
+
+        uint64_t ttl_ms = 0;
+        if (offset + sizeof(uint64_t) <= payload_len) {
+            ttl_ms = *reinterpret_cast<const uint64_t*>(payload_buffer.data() + offset);
+        }
 
         switch (type) {
             case WALRecordType::SET:
-                engine.set(key, value);
+                engine.set(key, value, ttl_ms > 0 ? std::optional<uint64_t>(ttl_ms) : std::nullopt);
                 ++recovered_count;
                 break;
             case WALRecordType::DEL:

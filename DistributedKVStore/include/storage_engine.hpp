@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -25,13 +26,14 @@ struct Command {
     CommandType type{CommandType::NOOP};
     std::string key;
     std::string value;
+    uint64_t ttl_ms{0};
 
     Command() = default;
-    Command(CommandType t, std::string k, std::string v = "")
-        : type(t), key(std::move(k)), value(std::move(v)) {}
+    Command(CommandType t, std::string k, std::string v = "", uint64_t ttl = 0)
+        : type(t), key(std::move(k)), value(std::move(v)), ttl_ms(ttl) {}
 
-    static Command make_set(std::string key, std::string value) {
-        return Command(CommandType::SET, std::move(key), std::move(value));
+    static Command make_set(std::string key, std::string value, uint64_t ttl_ms = 0) {
+        return Command(CommandType::SET, std::move(key), std::move(value), ttl_ms);
     }
 
     static Command make_del(std::string key) {
@@ -67,6 +69,15 @@ struct CommandResult {
     }
 };
 
+struct ValueEntry {
+    std::string value;
+    std::optional<std::chrono::steady_clock::time_point> expire_at{std::nullopt};
+
+    bool is_expired() const {
+        return expire_at.has_value() && std::chrono::steady_clock::now() >= *expire_at;
+    }
+};
+
 class StorageEngine {
 public:
     explicit StorageEngine(std::shared_ptr<WAL> wal = nullptr);
@@ -80,10 +91,13 @@ public:
 
     // --- Key-Value Point Operations ---
 
-    bool set(std::string_view key, std::string_view value);
-    std::optional<std::string> get(std::string_view key) const;
+    bool set(std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms = std::nullopt);
+    std::optional<std::string> get(std::string_view key);
     bool del(std::string_view key);
     bool exists(std::string_view key) const;
+    int64_t ttl(std::string_view key) const;
+    size_t purge_expired(size_t max_keys_to_check = 100);
+
     size_t size() const;
     bool empty() const;
     void clear();
@@ -105,7 +119,7 @@ private:
     CommandResult apply_unlocked(const Command& cmd);
 
     mutable std::shared_mutex mutex_;
-    std::unordered_map<std::string, std::string> store_;
+    std::unordered_map<std::string, ValueEntry> store_;
     std::shared_ptr<WAL> wal_{nullptr};
 };
 

@@ -17,7 +17,8 @@ enum class OpCode : uint8_t {
     SET = 2,
     GET = 3,
     DEL = 4,
-    STATS = 5
+    STATS = 5,
+    TTL = 6
 };
 
 enum class StatusCode : uint8_t {
@@ -30,12 +31,14 @@ struct Request {
     OpCode op{OpCode::PING};
     std::string key;
     std::string value;
+    uint64_t ttl_ms{0};
 
     static Request make_ping();
-    static Request make_set(std::string key, std::string value);
+    static Request make_set(std::string key, std::string value, uint64_t ttl_ms = 0);
     static Request make_get(std::string key);
     static Request make_del(std::string key);
     static Request make_stats();
+    static Request make_ttl(std::string key);
 };
 
 struct Response {
