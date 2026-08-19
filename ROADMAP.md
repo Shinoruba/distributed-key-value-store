@@ -18,8 +18,8 @@
 - [x] Define cluster membership configuration (node IDs, endpoints).
 - [x] Implement RPC protocol between nodes (AppendEntries, RequestVote).
 - [x] Implement Leader Election with randomized heartbeat/election timers.
-- [ ] Implement Log Replication across quorum before committing to the local store.
-- [ ] Add client forwarding (redirect non-leader writes to current leader).
+- [x] Implement Log Replication across quorum before committing to the local store.
+- [x] Add client forwarding (redirect non-leader writes to current leader).
 
 ### Phase 4: Fault Tolerance, Compaction & Tooling
 - [ ] Implement Log Compaction and Snapshotting to limit WAL growth.

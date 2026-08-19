@@ -19,6 +19,9 @@ RaftNode::RaftNode(NodeId node_id, std::string host, uint16_t port,
       election_timer_(ioc),
       heartbeat_timer_(ioc),
       rng_(std::random_device{}() + std::hash<std::string>{}(node_id_)) {
+    // Index 0 dummy entry
+    log_.push_back(LogEntry{0, 0, Command::make_noop()});
+
     asio::error_code ec;
     auto ep = acceptor_.local_endpoint(ec);
     if (!ec) {
@@ -53,6 +56,13 @@ void RaftNode::stop() {
             heartbeat_timer_.cancel();
             acceptor_.close(ec);
             role_ = NodeRole::FOLLOWER;
+
+            for (auto& [idx, cbs] : pending_callbacks_) {
+                for (auto& cb : cbs) {
+                    cb(false, "");
+                }
+            }
+            pending_callbacks_.clear();
         });
     }
 }
@@ -82,11 +92,58 @@ uint16_t RaftNode::port() const {
 }
 
 size_t RaftNode::log_size() const {
-    return log_.size();
+    return log_.size() > 0 ? log_.size() - 1 : 0;
+}
+
+LogIndex RaftNode::commit_index() const {
+    return commit_index_;
+}
+
+LogIndex RaftNode::last_applied() const {
+    return last_applied_;
 }
 
 bool RaftNode::is_running() const noexcept {
     return running_.load();
+}
+
+void RaftNode::propose(const Command& cmd,
+                       std::function<void(bool success, std::string leader_id)> callback) {
+    asio::post(strand_, [this, self = shared_from_this(), cmd, callback = std::move(callback)]() mutable {
+        if (!running_ || role_ != NodeRole::LEADER) {
+            callback(false, current_leader_id_);
+            return;
+        }
+
+        const LogIndex new_index = static_cast<LogIndex>(log_.size());
+        LogEntry entry{current_term_, new_index, cmd};
+        log_.push_back(std::move(entry));
+        pending_callbacks_[new_index].push_back(std::move(callback));
+
+        if (peers_.empty()) {
+            commit_index_ = new_index;
+            apply_entries_to_state_machine();
+            return;
+        }
+
+        for (const auto& peer : peers_) {
+            replicate_to_peer(peer);
+        }
+    });
+}
+
+bool RaftNode::propose(const Command& cmd, std::chrono::milliseconds timeout) {
+    auto prom = std::make_shared<std::promise<std::pair<bool, std::string>>>();
+    auto fut = prom->get_future();
+
+    propose(cmd, [prom](bool success, std::string leader_id) {
+        prom->set_value({success, std::move(leader_id)});
+    });
+
+    if (fut.wait_for(timeout) == std::future_status::ready) {
+        return fut.get().first;
+    }
+    return false;
 }
 
 void RaftNode::reset_election_timeout() {
@@ -135,7 +192,7 @@ void RaftNode::become_leader() {
 
     next_index_.clear();
     match_index_.clear();
-    const LogIndex last_idx = log_.empty() ? 0 : log_.back().index;
+    const LogIndex last_idx = log_.empty() ? 0 : static_cast<LogIndex>(log_.size() - 1);
     for (const auto& peer : peers_) {
         next_index_[peer.id] = last_idx + 1;
         match_index_[peer.id] = 0;
@@ -150,6 +207,14 @@ void RaftNode::become_follower(Term term, NodeId leader_id) {
     voted_for_.clear();
     current_leader_id_ = std::move(leader_id);
     heartbeat_timer_.cancel();
+
+    for (auto& [idx, cbs] : pending_callbacks_) {
+        for (auto& cb : cbs) {
+            cb(false, current_leader_id_);
+        }
+    }
+    pending_callbacks_.clear();
+
     reset_election_timeout();
 }
 
@@ -191,33 +256,67 @@ void RaftNode::broadcast_request_vote() {
     }
 }
 
-void RaftNode::broadcast_heartbeats() {
+void RaftNode::replicate_to_peer(const PeerConfig& peer) {
     if (!running_ || role_ != NodeRole::LEADER) return;
+
+    LogIndex p_next = next_index_[peer.id];
+    if (p_next == 0) p_next = 1;
+    if (p_next > log_.size()) p_next = static_cast<LogIndex>(log_.size());
+
+    const LogIndex prev_idx = p_next - 1;
+    const Term prev_term = log_[prev_idx].term;
 
     AppendEntriesArgs args;
     args.term = current_term_;
     args.leader_id = node_id_;
-    args.prev_log_index = log_.empty() ? 0 : log_.back().index;
-    args.prev_log_term = log_.empty() ? 0 : log_.back().term;
+    args.prev_log_index = prev_idx;
+    args.prev_log_term = prev_term;
     args.leader_commit = commit_index_;
 
+    for (size_t i = p_next; i < log_.size(); ++i) {
+        args.entries.push_back(log_[i]);
+    }
+
     auto payload = RaftRpcSerializer::serialize_append_entries_args(args);
-    const Term heartbeat_term = current_term_;
+    const Term req_term = current_term_;
+
+    send_rpc_async(peer, payload, [this, self = shared_from_this(), peer_id = peer.id, req_term](const std::vector<uint8_t>& resp_data, const asio::error_code& ec) {
+        if (ec || !running_ || role_ != NodeRole::LEADER || current_term_ != req_term) {
+            return;
+        }
+
+        if (resp_data.size() <= sizeof(uint32_t)) return;
+        auto reply = RaftRpcSerializer::deserialize_append_entries_reply(resp_data.data() + sizeof(uint32_t), resp_data.size() - sizeof(uint32_t));
+        if (!reply) return;
+
+        if (reply->term > current_term_) {
+            become_follower(reply->term);
+            return;
+        }
+
+        if (reply->success) {
+            match_index_[peer_id] = std::max(match_index_[peer_id], reply->match_index);
+            next_index_[peer_id] = match_index_[peer_id] + 1;
+            check_and_advance_commit_index();
+        } else {
+            if (next_index_[peer_id] > 1) {
+                --next_index_[peer_id];
+                for (const auto& p : peers_) {
+                    if (p.id == peer_id) {
+                        replicate_to_peer(p);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+void RaftNode::broadcast_heartbeats() {
+    if (!running_ || role_ != NodeRole::LEADER) return;
 
     for (const auto& peer : peers_) {
-        send_rpc_async(peer, payload, [this, self = shared_from_this(), heartbeat_term](const std::vector<uint8_t>& resp_data, const asio::error_code& ec) {
-            if (ec || !running_ || role_ != NodeRole::LEADER || current_term_ != heartbeat_term) {
-                return;
-            }
-
-            if (resp_data.size() <= sizeof(uint32_t)) return;
-            auto reply = RaftRpcSerializer::deserialize_append_entries_reply(resp_data.data() + sizeof(uint32_t), resp_data.size() - sizeof(uint32_t));
-            if (!reply) return;
-
-            if (reply->term > current_term_) {
-                become_follower(reply->term);
-            }
-        });
+        replicate_to_peer(peer);
     }
 
     heartbeat_timer_.expires_after(std::chrono::milliseconds(50));
@@ -226,6 +325,46 @@ void RaftNode::broadcast_heartbeats() {
             broadcast_heartbeats();
         }
     }));
+}
+
+void RaftNode::check_and_advance_commit_index() {
+    if (role_ != NodeRole::LEADER) return;
+
+    for (LogIndex n = log_.size() - 1; n > commit_index_; --n) {
+        if (log_[n].term != current_term_) continue;
+
+        size_t count = 1;
+        for (const auto& peer : peers_) {
+            if (match_index_[peer.id] >= n) {
+                ++count;
+            }
+        }
+
+        const size_t quorum = ((peers_.size() + 1) / 2) + 1;
+        if (count >= quorum) {
+            commit_index_ = n;
+            apply_entries_to_state_machine();
+            break;
+        }
+    }
+}
+
+void RaftNode::apply_entries_to_state_machine() {
+    while (commit_index_ > last_applied_) {
+        ++last_applied_;
+        if (last_applied_ < log_.size()) {
+            const auto& entry = log_[last_applied_];
+            engine_.apply(entry.command);
+
+            auto it = pending_callbacks_.find(last_applied_);
+            if (it != pending_callbacks_.end()) {
+                for (auto& cb : it->second) {
+                    cb(true, node_id_);
+                }
+                pending_callbacks_.erase(it);
+            }
+        }
+    }
 }
 
 RequestVoteReply RaftNode::handle_request_vote(const RequestVoteArgs& args) {
@@ -263,7 +402,34 @@ AppendEntriesReply RaftNode::handle_append_entries(const AppendEntriesArgs& args
         reset_election_timeout();
     }
 
-    return {current_term_, true, args.prev_log_index};
+    if (args.prev_log_index >= log_.size()) {
+        return {current_term_, false, log_.empty() ? 0 : static_cast<LogIndex>(log_.size() - 1)};
+    }
+
+    if (log_[args.prev_log_index].term != args.prev_log_term) {
+        log_.resize(args.prev_log_index);
+        return {current_term_, false, log_.empty() ? 0 : static_cast<LogIndex>(log_.size() - 1)};
+    }
+
+    LogIndex insert_idx = args.prev_log_index + 1;
+    for (const auto& entry : args.entries) {
+        if (insert_idx < log_.size()) {
+            if (log_[insert_idx].term != entry.term) {
+                log_.resize(insert_idx);
+                log_.push_back(entry);
+            }
+        } else {
+            log_.push_back(entry);
+        }
+        ++insert_idx;
+    }
+
+    if (args.leader_commit > commit_index_) {
+        commit_index_ = std::min(args.leader_commit, static_cast<LogIndex>(log_.size() - 1));
+        apply_entries_to_state_machine();
+    }
+
+    return {current_term_, true, static_cast<LogIndex>(log_.size() - 1)};
 }
 
 void RaftNode::do_accept() {

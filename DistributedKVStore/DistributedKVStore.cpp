@@ -507,6 +507,156 @@ void test_raft_3node_cluster_leader_election_and_failover() {
     std::cout << "[PASS] 3-Node Raft Cluster Leader Election & Failover tests passed.\n" << std::endl;
 }
 
+void test_raft_log_replication_and_catchup() {
+    std::cout << "=== Running Raft Log Replication, Quorum Commit & Catch-Up Test ===" << std::endl;
+
+    asio::io_context ioc;
+    StorageEngine engine1, engine2, engine3;
+
+    auto node1 = std::make_shared<RaftNode>("node_1", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine1);
+    auto node2 = std::make_shared<RaftNode>("node_2", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine2);
+    auto node3 = std::make_shared<RaftNode>("node_3", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine3);
+
+    node1->set_peers({{"node_2", "127.0.0.1", node2->port()}, {"node_3", "127.0.0.1", node3->port()}});
+    node2->set_peers({{"node_1", "127.0.0.1", node1->port()}, {"node_3", "127.0.0.1", node3->port()}});
+    node3->set_peers({{"node_1", "127.0.0.1", node1->port()}, {"node_2", "127.0.0.1", node2->port()}});
+
+    node1->start();
+    node2->start();
+    node3->start();
+
+    const int NUM_WORKER_THREADS = 4;
+    std::vector<std::thread> workers;
+    workers.reserve(NUM_WORKER_THREADS);
+    for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
+        workers.emplace_back([&ioc]() {
+            ioc.run();
+        });
+    }
+
+    // 1. Wait for leader
+    std::shared_ptr<RaftNode> leader = nullptr;
+    for (int retry = 0; retry < 40; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (node1->is_leader()) leader = node1;
+        else if (node2->is_leader()) leader = node2;
+        else if (node3->is_leader()) leader = node3;
+        if (leader) break;
+    }
+    assert(leader != nullptr);
+    std::cout << "Leader for replication test: " << leader->node_id() << std::endl;
+
+    // 2. Propose 100 SET commands to leader
+    for (int i = 0; i < 100; ++i) {
+        std::string key = "replicated_k" + std::to_string(i);
+        std::string val = "replicated_v" + std::to_string(i);
+        bool ok = leader->propose(Command::make_set(key, val));
+        (void)ok;
+        assert(ok);
+    }
+    std::cout << "Successfully proposed and committed 100 commands to leader." << std::endl;
+
+    // Wait for followers to apply commit index
+    for (int retry = 0; retry < 40; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (engine1.size() == 100 && engine2.size() == 100 && engine3.size() == 100) {
+            break;
+        }
+    }
+
+    assert(engine1.size() == 100);
+    assert(engine2.size() == 100);
+    assert(engine3.size() == 100);
+
+    for (int i = 0; i < 100; ++i) {
+        std::string key = "replicated_k" + std::to_string(i);
+        std::string val = "replicated_v" + std::to_string(i);
+        assert(engine1.get(key).value() == val);
+        assert(engine2.get(key).value() == val);
+        assert(engine3.get(key).value() == val);
+    }
+    std::cout << "All 3 nodes verified with 100 identical key-value entries." << std::endl;
+
+    // 3. Disconnect one follower (simulate network failure)
+    std::shared_ptr<RaftNode> follower_to_partition = nullptr;
+    std::shared_ptr<RaftNode> other_follower = nullptr;
+
+    if (node1 != leader) {
+        follower_to_partition = node1;
+        other_follower = (node2 != leader) ? node2 : node3;
+    } else if (node2 != leader) {
+        follower_to_partition = node2;
+        other_follower = node3;
+    } else {
+        follower_to_partition = node3;
+        other_follower = node2;
+    }
+
+    std::cout << "Simulating network partition on follower " << follower_to_partition->node_id() << "..." << std::endl;
+    follower_to_partition->stop();
+
+    // 4. Propose 50 more commands to the leader while 1 follower is partitioned (2/3 quorum)
+    for (int i = 100; i < 150; ++i) {
+        std::string key = "replicated_k" + std::to_string(i);
+        std::string val = "replicated_v" + std::to_string(i);
+        bool ok = leader->propose(Command::make_set(key, val));
+        (void)ok;
+        assert(ok);
+    }
+    std::cout << "Successfully committed 50 additional writes across 2/3 quorum." << std::endl;
+
+    StorageEngine& leader_eng = (leader == node1 ? engine1 : (leader == node2 ? engine2 : engine3));
+    StorageEngine& other_eng = (other_follower == node1 ? engine1 : (other_follower == node2 ? engine2 : engine3));
+    StorageEngine& part_eng = (follower_to_partition == node1 ? engine1 : (follower_to_partition == node2 ? engine2 : engine3));
+
+    // Wait for other follower to apply
+    for (int retry = 0; retry < 40; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (other_eng.size() == 150) {
+            break;
+        }
+    }
+
+    (void)leader_eng;
+    (void)other_eng;
+    (void)part_eng;
+    assert(leader_eng.size() == 150);
+    assert(other_eng.size() == 150);
+    assert(part_eng.size() == 100);
+
+    // 5. Reconnect the partitioned follower and assert catch-up
+    std::cout << "Reconnecting partitioned follower " << follower_to_partition->node_id() << " to cluster..." << std::endl;
+    follower_to_partition->start();
+
+    // Wait for leader heartbeat / replication to catch up the reconnected follower
+    for (int retry = 0; retry < 50; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (part_eng.size() == 150) {
+            break;
+        }
+    }
+
+    assert(part_eng.size() == 150);
+    for (int i = 0; i < 150; ++i) {
+        std::string key = "replicated_k" + std::to_string(i);
+        std::string val = "replicated_v" + std::to_string(i);
+        assert(part_eng.get(key).value() == val);
+    }
+    std::cout << "Partitioned follower successfully caught up to 150 entries." << std::endl;
+
+    // Teardown
+    node1->stop();
+    node2->stop();
+    node3->stop();
+    ioc.stop();
+
+    for (auto& w : workers) {
+        w.join();
+    }
+
+    std::cout << "[PASS] Raft Log Replication, Quorum Commit & Catch-Up tests passed.\n" << std::endl;
+}
+
 void test_concurrency_stress() {
     std::cout << "=== Running Multi-Threaded Concurrency Stress Test ===" << std::endl;
 
@@ -633,6 +783,7 @@ int main() {
         test_tcp_server_async_multiclient();
         test_raft_rpc_serialization();
         test_raft_3node_cluster_leader_election_and_failover();
+        test_raft_log_replication_and_catchup();
         test_concurrency_stress();
 
         std::cout << "=================================================" << std::endl;

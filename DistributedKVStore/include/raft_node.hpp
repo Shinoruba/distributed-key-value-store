@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <random>
 #include <string>
@@ -40,7 +41,15 @@ public:
     NodeId leader_id() const;
     uint16_t port() const;
     size_t log_size() const;
+    LogIndex commit_index() const;
+    LogIndex last_applied() const;
     bool is_running() const noexcept;
+
+    void propose(const Command& cmd,
+                 std::function<void(bool success, std::string leader_id)> callback);
+
+    bool propose(const Command& cmd,
+                 std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
 
     RequestVoteReply handle_request_vote(const RequestVoteArgs& args);
     AppendEntriesReply handle_append_entries(const AppendEntriesArgs& args);
@@ -53,6 +62,9 @@ private:
     void become_follower(Term term, NodeId leader_id = "");
     void broadcast_heartbeats();
     void broadcast_request_vote();
+    void replicate_to_peer(const PeerConfig& peer);
+    void check_and_advance_commit_index();
+    void apply_entries_to_state_machine();
 
     void send_rpc_async(const PeerConfig& peer, std::vector<uint8_t> payload,
                         std::function<void(const std::vector<uint8_t>&, const asio::error_code&)> callback);
@@ -79,6 +91,8 @@ private:
     std::unordered_map<NodeId, LogIndex> next_index_;
     std::unordered_map<NodeId, LogIndex> match_index_;
     size_t votes_granted_{0};
+
+    std::unordered_map<LogIndex, std::vector<std::function<void(bool, std::string)>>> pending_callbacks_;
 
     asio::steady_timer election_timer_;
     asio::steady_timer heartbeat_timer_;
