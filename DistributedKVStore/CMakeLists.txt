@@ -13,6 +13,11 @@ add_executable(DistributedKVStore
     "include/tcp_session.hpp"
     "src/tcp_server.cpp"
     "include/tcp_server.hpp"
+    "src/raft_rpc.cpp"
+    "include/raft_rpc.hpp"
+    "src/raft_node.cpp"
+    "include/raft_node.hpp"
+    "include/raft_types.hpp"
 )
 
 target_include_directories(DistributedKVStore PUBLIC

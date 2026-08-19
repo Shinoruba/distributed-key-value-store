@@ -16,6 +16,8 @@
 #include "wal.hpp"
 #include "protocol.hpp"
 #include "tcp_server.hpp"
+#include "raft_node.hpp"
+#include "raft_rpc.hpp"
 
 using namespace distributed_kv;
 
@@ -291,7 +293,6 @@ void test_tcp_server_async_multiclient() {
 
     uint16_t port = server.port();
     assert(port != 0);
-    std::cout << "TcpServer listening on 127.0.0.1:" << port << std::endl;
 
     const int NUM_WORKER_THREADS = 4;
     std::vector<std::thread> workers;
@@ -360,8 +361,6 @@ void test_tcp_server_async_multiclient() {
         t.join();
     }
 
-    std::cout << "All " << NUM_CLIENTS << " clients completed successfully. Total TCP operations: " << successful_ops.load() << std::endl;
-
     server.stop();
     ioc.stop();
 
@@ -370,6 +369,142 @@ void test_tcp_server_async_multiclient() {
     }
 
     std::cout << "[PASS] Async TCP Server Multi-Client integration tests passed.\n" << std::endl;
+}
+
+void test_raft_rpc_serialization() {
+    std::cout << "=== Running Raft RPC Serialization Tests ===" << std::endl;
+
+    RequestVoteArgs rv_args;
+    rv_args.term = 42;
+    rv_args.candidate_id = "node_candidate_99";
+    rv_args.last_log_index = 1005;
+    rv_args.last_log_term = 41;
+
+    auto rv_bytes = RaftRpcSerializer::serialize_request_vote_args(rv_args);
+    auto rv_deser = RaftRpcSerializer::deserialize_request_vote_args(rv_bytes.data() + 4, rv_bytes.size() - 4);
+    assert(rv_deser.has_value());
+    assert(rv_deser->term == 42);
+    assert(rv_deser->candidate_id == "node_candidate_99");
+    assert(rv_deser->last_log_index == 1005);
+    assert(rv_deser->last_log_term == 41);
+
+    RequestVoteReply rv_reply{42, true};
+    auto rvr_bytes = RaftRpcSerializer::serialize_request_vote_reply(rv_reply);
+    auto rvr_deser = RaftRpcSerializer::deserialize_request_vote_reply(rvr_bytes.data() + 4, rvr_bytes.size() - 4);
+    assert(rvr_deser.has_value());
+    assert(rvr_deser->term == 42);
+    assert(rvr_deser->vote_granted == true);
+
+    AppendEntriesArgs ae_args;
+    ae_args.term = 55;
+    ae_args.leader_id = "leader_node_1";
+    ae_args.prev_log_index = 100;
+    ae_args.prev_log_term = 54;
+    ae_args.leader_commit = 98;
+    ae_args.entries.push_back({55, 101, Command::make_set("k_raft", "v_raft")});
+
+    auto ae_bytes = RaftRpcSerializer::serialize_append_entries_args(ae_args);
+    auto ae_deser = RaftRpcSerializer::deserialize_append_entries_args(ae_bytes.data() + 4, ae_bytes.size() - 4);
+    assert(ae_deser.has_value());
+    assert(ae_deser->term == 55);
+    assert(ae_deser->leader_id == "leader_node_1");
+    assert(ae_deser->entries.size() == 1);
+    assert(ae_deser->entries[0].command.key == "k_raft");
+    assert(ae_deser->entries[0].command.value == "v_raft");
+
+    AppendEntriesReply ae_reply{55, true, 101};
+    auto aer_bytes = RaftRpcSerializer::serialize_append_entries_reply(ae_reply);
+    auto aer_deser = RaftRpcSerializer::deserialize_append_entries_reply(aer_bytes.data() + 4, aer_bytes.size() - 4);
+    assert(aer_deser.has_value());
+    assert(aer_deser->term == 55);
+    assert(aer_deser->success == true);
+    assert(aer_deser->match_index == 101);
+
+    std::cout << "[PASS] Raft RPC Serialization tests passed.\n" << std::endl;
+}
+
+void test_raft_3node_cluster_leader_election_and_failover() {
+    std::cout << "=== Running 3-Node Raft Cluster Leader Election & Failover Test ===" << std::endl;
+
+    asio::io_context ioc;
+    StorageEngine engine1, engine2, engine3;
+
+    auto node1 = std::make_shared<RaftNode>("node_1", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine1);
+    auto node2 = std::make_shared<RaftNode>("node_2", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine2);
+    auto node3 = std::make_shared<RaftNode>("node_3", "127.0.0.1", static_cast<uint16_t>(0), std::vector<PeerConfig>{}, ioc, engine3);
+
+    node1->set_peers({{"node_2", "127.0.0.1", node2->port()}, {"node_3", "127.0.0.1", node3->port()}});
+    node2->set_peers({{"node_1", "127.0.0.1", node1->port()}, {"node_3", "127.0.0.1", node3->port()}});
+    node3->set_peers({{"node_1", "127.0.0.1", node1->port()}, {"node_2", "127.0.0.1", node2->port()}});
+
+    std::cout << "Cluster Nodes initialized on ports: "
+              << "node_1=" << node1->port() << ", node_2=" << node2->port() << ", node_3=" << node3->port() << std::endl;
+
+    node1->start();
+    node2->start();
+    node3->start();
+
+    const int NUM_WORKER_THREADS = 4;
+    std::vector<std::thread> workers;
+    workers.reserve(NUM_WORKER_THREADS);
+    for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
+        workers.emplace_back([&ioc]() {
+            ioc.run();
+        });
+    }
+
+    std::shared_ptr<RaftNode> leader = nullptr;
+    for (int retry = 0; retry < 40; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        int leader_count = 0;
+        if (node1->is_leader()) { ++leader_count; leader = node1; }
+        if (node2->is_leader()) { ++leader_count; leader = node2; }
+        if (node3->is_leader()) { ++leader_count; leader = node3; }
+
+        if (leader_count == 1) {
+            break;
+        }
+    }
+
+    assert(leader != nullptr);
+    std::cout << "Initial Leader elected: " << leader->node_id() << " (Term: " << leader->current_term() << ")" << std::endl;
+
+    int initial_leaders = (node1->is_leader() ? 1 : 0) + (node2->is_leader() ? 1 : 0) + (node3->is_leader() ? 1 : 0);
+    (void)initial_leaders;
+    assert(initial_leaders == 1);
+
+    std::string dead_leader_id = leader->node_id();
+    std::cout << "Simulating crash of leader " << dead_leader_id << "..." << std::endl;
+    leader->stop();
+
+    std::shared_ptr<RaftNode> new_leader = nullptr;
+    for (int retry = 0; retry < 50; ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        int leader_count = 0;
+        if (node1->is_running() && node1->is_leader()) { ++leader_count; new_leader = node1; }
+        if (node2->is_running() && node2->is_leader()) { ++leader_count; new_leader = node2; }
+        if (node3->is_running() && node3->is_leader()) { ++leader_count; new_leader = node3; }
+
+        if (leader_count == 1 && new_leader->node_id() != dead_leader_id) {
+            break;
+        }
+    }
+
+    assert(new_leader != nullptr);
+    assert(new_leader->node_id() != dead_leader_id);
+    std::cout << "New Leader successfully elected after failover: " << new_leader->node_id()
+              << " (Term: " << new_leader->current_term() << ")" << std::endl;
+
+    node1->stop();
+    node2->stop();
+    node3->stop();
+    ioc.stop();
+
+    for (auto& w : workers) {
+        w.join();
+    }
+
+    std::cout << "[PASS] 3-Node Raft Cluster Leader Election & Failover tests passed.\n" << std::endl;
 }
 
 void test_concurrency_stress() {
@@ -496,6 +631,8 @@ int main() {
         test_wal_corruption_and_truncation();
         test_protocol_serialization();
         test_tcp_server_async_multiclient();
+        test_raft_rpc_serialization();
+        test_raft_3node_cluster_leader_election_and_failover();
         test_concurrency_stress();
 
         std::cout << "=================================================" << std::endl;

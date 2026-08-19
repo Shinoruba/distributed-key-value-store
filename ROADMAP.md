@@ -15,9 +15,9 @@
 - [x] Integration test: send concurrent client requests to the server over TCP.
 
 ### Phase 3: Distributed Consensus & Replication
-- [ ] Define cluster membership configuration (node IDs, endpoints).
-- [ ] Implement RPC protocol between nodes (AppendEntries, RequestVote).
-- [ ] Implement Leader Election with randomized heartbeat/election timers.
+- [x] Define cluster membership configuration (node IDs, endpoints).
+- [x] Implement RPC protocol between nodes (AppendEntries, RequestVote).
+- [x] Implement Leader Election with randomized heartbeat/election timers.
 - [ ] Implement Log Replication across quorum before committing to the local store.
 - [ ] Add client forwarding (redirect non-leader writes to current leader).
 
