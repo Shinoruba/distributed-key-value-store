@@ -1,20 +1,24 @@
 #pragma once
 
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <optional>
 #include <unordered_map>
 #include <vector>
-#include <shared_mutex>
-#include <mutex>
-#include <cstdint>
 
 namespace distributed_kv {
 
+class WAL;
+
 enum class CommandType : uint8_t {
-    SET,
-    DEL,
-    NOOP
+    SET = 1,
+    DEL = 2,
+    CLEAR = 3,
+    NOOP = 4
 };
 
 struct Command {
@@ -32,6 +36,10 @@ struct Command {
 
     static Command make_del(std::string key) {
         return Command(CommandType::DEL, std::move(key));
+    }
+
+    static Command make_clear() {
+        return Command(CommandType::CLEAR, "");
     }
 
     static Command make_noop() {
@@ -61,7 +69,7 @@ struct CommandResult {
 
 class StorageEngine {
 public:
-    StorageEngine() = default;
+    explicit StorageEngine(std::shared_ptr<WAL> wal = nullptr);
     ~StorageEngine() = default;
 
     StorageEngine(const StorageEngine&) = delete;
@@ -73,36 +81,32 @@ public:
     // --- Key-Value Point Operations ---
 
     bool set(std::string_view key, std::string_view value);
-
     std::optional<std::string> get(std::string_view key) const;
-
     bool del(std::string_view key);
-
     bool exists(std::string_view key) const;
-
     size_t size() const;
-
     bool empty() const;
-
     void clear();
 
     // --- Deterministic State Machine Operations (Raft) ---
 
     CommandResult apply(const Command& cmd);
-
     std::vector<CommandResult> apply_batch(const std::vector<Command>& batch);
 
-    // --- Snapshotting Support ---
+    // --- Snapshotting & WAL Integration ---
 
     std::unordered_map<std::string, std::string> snapshot() const;
-
     void restore_snapshot(const std::unordered_map<std::string, std::string>& data);
+
+    void attach_wal(std::shared_ptr<WAL> wal);
+    std::shared_ptr<WAL> wal() const noexcept;
 
 private:
     CommandResult apply_unlocked(const Command& cmd);
 
     mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, std::string> store_;
+    std::shared_ptr<WAL> wal_{nullptr};
 };
 
 } // namespace distributed_kv

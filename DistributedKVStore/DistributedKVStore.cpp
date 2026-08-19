@@ -7,8 +7,12 @@
 #include <cassert>
 #include <random>
 #include <iomanip>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 
 #include "storage_engine.hpp"
+#include "wal.hpp"
 
 using namespace distributed_kv;
 
@@ -19,7 +23,6 @@ void test_basic_crud() {
     assert(engine.empty());
     assert(engine.size() == 0);
 
-    // Test SET & GET
     assert(engine.set("user:100", "Alice"));
     assert(engine.set("user:101", "Bob"));
     assert(engine.size() == 2);
@@ -34,23 +37,19 @@ void test_basic_crud() {
     auto non_existent = engine.get("user:999");
     assert(!non_existent.has_value());
 
-    // Test Overwrite
     assert(engine.set("user:100", "Alice_Updated"));
     auto val_updated = engine.get("user:100");
     assert(val_updated.has_value() && *val_updated == "Alice_Updated");
     assert(engine.size() == 2);
 
-    // Test Exists
     assert(engine.exists("user:100"));
     assert(!engine.exists("user:999"));
 
-    // Test DEL
     assert(engine.del("user:101"));
     assert(!engine.exists("user:101"));
     assert(engine.size() == 1);
-    assert(!engine.del("user:101")); // Deleting non-existent returns false
+    assert(!engine.del("user:101"));
 
-    // Test Clear
     engine.clear();
     assert(engine.empty());
     assert(engine.size() == 0);
@@ -59,10 +58,9 @@ void test_basic_crud() {
 }
 
 void test_state_machine_batching_and_snapshot() {
-    std::cout << "=== Running State Machine and Batching Tests ===" << std::endl;
+    std::cout << "=== Running State Machine & Batching Tests ===" << std::endl;
     StorageEngine engine;
 
-    // Apply individual commands
     auto res1 = engine.apply(Command::make_set("k1", "v1"));
     assert(res1.success);
     assert(!res1.previous_value.has_value());
@@ -101,7 +99,6 @@ void test_state_machine_batching_and_snapshot() {
     assert(engine.get("cluster:node1").value() == "192.168.1.10:8000");
     assert(!engine.exists("temp_key"));
 
-    // Test Snapshot & Restore
     auto snap = engine.snapshot();
     assert(snap.size() == 3);
     assert(snap["cluster:node2"] == "192.168.1.11:8000");
@@ -112,6 +109,121 @@ void test_state_machine_batching_and_snapshot() {
     assert(restored_engine.get("cluster:node3").value() == "192.168.1.12:8000");
 
     std::cout << "[PASS] State Machine, Batching & Snapshot tests passed successfully.\n" << std::endl;
+}
+
+void test_wal_durability_and_recovery() {
+    std::cout << "=== Running WAL Durability & Crash Recovery Tests ===" << std::endl;
+    std::filesystem::path wal_path = "test_data/wal_recovery.log";
+    std::filesystem::remove(wal_path);
+
+    std::unordered_map<std::string, std::string> expected_state;
+
+    {
+        auto wal = std::make_shared<WAL>(wal_path);
+        StorageEngine engine(wal);
+
+        for (int i = 0; i < 50; ++i) {
+            std::string k = "user:" + std::to_string(i);
+            std::string v = "payload_" + std::to_string(i * 10);
+            engine.set(k, v);
+            expected_state[k] = v;
+        }
+
+        engine.set("user:10", "payload_10_updated");
+        expected_state["user:10"] = "payload_10_updated";
+
+        engine.del("user:25");
+        expected_state.erase("user:25");
+
+        engine.apply(Command::make_set("cluster:leader", "node_1"));
+        expected_state["cluster:leader"] = "node_1";
+
+        std::vector<Command> batch = {
+            Command::make_set("batch_k1", "batch_v1"),
+            Command::make_set("batch_k2", "batch_v2"),
+            Command::make_del("user:30")
+        };
+        engine.apply_batch(batch);
+        expected_state["batch_k1"] = "batch_v1";
+        expected_state["batch_k2"] = "batch_v2";
+        expected_state.erase("user:30");
+
+        assert(engine.size() == expected_state.size());
+        // Simulating crash: objects destroyed right here
+    }
+
+    {
+        StorageEngine recovered_engine;
+        WAL recovery_wal(wal_path);
+
+        size_t replayed = recovery_wal.recover(recovered_engine);
+        std::cout << "Replayed " << replayed << " records from WAL." << std::endl;
+
+        assert(recovered_engine.size() == expected_state.size());
+
+        for (const auto& [k, v] : expected_state) {
+            auto val = recovered_engine.get(k);
+            assert(val.has_value());
+            assert(*val == v);
+        }
+
+        assert(!recovered_engine.exists("user:25"));
+        assert(!recovered_engine.exists("user:30"));
+    }
+
+    std::cout << "[PASS] WAL Durability and Recovery verified successfully.\n" << std::endl;
+}
+
+void test_wal_corruption_and_truncation() {
+    std::cout << "=== Running WAL Corruption & Truncation Tests ===" << std::endl;
+    std::filesystem::path wal_path = "test_data/wal_corrupt.log";
+    std::filesystem::remove(wal_path);
+
+    {
+        WAL wal(wal_path);
+        wal.append_set("k1", "v1");
+        wal.append_set("k2", "v2");
+        wal.append_set("k3", "v3");
+        wal.close();
+    }
+
+    // Inject corrupted bytes at the end of the WAL file
+    {
+        std::ofstream out(wal_path, std::ios::binary | std::ios::app);
+        const char garbage[] = { '\xFF', '\x00', '\xDE', '\xAD', '\xBE', '\xEF' };
+        out.write(garbage, sizeof(garbage));
+    }
+
+    // Recovery must safely read valid prefix and stop without crashing on corrupted tail
+    {
+        StorageEngine engine;
+        WAL recovery_wal(wal_path);
+        size_t replayed = recovery_wal.recover(engine);
+        (void)replayed;
+        assert(replayed == 3);
+        assert(engine.size() == 3);
+        assert(engine.get("k1").value() == "v1");
+        assert(engine.get("k2").value() == "v2");
+        assert(engine.get("k3").value() == "v3");
+    }
+
+    // Test Truncation
+    {
+        WAL wal(wal_path);
+        assert(wal.size_bytes() > 0);
+        wal.truncate();
+        assert(wal.size_bytes() == 0);
+
+        wal.append_set("fresh_key", "fresh_value");
+        StorageEngine engine;
+        size_t replayed = wal.recover(engine);
+        (void)replayed;
+        assert(replayed == 1);
+        assert(engine.get("fresh_key").value() == "fresh_value");
+    }
+
+    std::filesystem::remove_all("test_data");
+    std::cout << "[PASS] WAL Corruption handling and Truncation verified successfully.\n" << std::endl;
 }
 
 void test_concurrency_stress() {
@@ -132,7 +244,6 @@ void test_concurrency_stress() {
     std::atomic<uint64_t> total_deletes{0};
     std::atomic<uint64_t> batch_commands_applied{0};
 
-    // Pre-populate some keys
     for (int i = 0; i < 200; ++i) {
         engine.set("key_" + std::to_string(i), "init_val_" + std::to_string(i));
     }
@@ -140,7 +251,6 @@ void test_concurrency_stress() {
     std::vector<std::thread> threads;
     threads.reserve(NUM_READERS + NUM_WRITERS);
 
-    // Spawn Writer Threads
     for (int w = 0; w < NUM_WRITERS; ++w) {
         threads.emplace_back([&, w]() {
             while (!start_flag.load(std::memory_order_acquire)) {
@@ -157,16 +267,13 @@ void test_concurrency_stress() {
                 std::string key = "key_" + std::to_string(k);
 
                 if (op < 6) {
-                    // SET operation (60%)
                     std::string val = "val_w" + std::to_string(w) + "_" + std::to_string(i);
                     engine.set(key, val);
                     total_writes.fetch_add(1, std::memory_order_relaxed);
                 } else if (op < 8) {
-                    // DEL operation (20%)
                     engine.del(key);
                     total_deletes.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    // Atomic Batch operation (20%)
                     int k2 = key_dist(rng);
                     std::string key2 = "key_" + std::to_string(k2);
                     std::vector<Command> batch = {
@@ -180,7 +287,6 @@ void test_concurrency_stress() {
         });
     }
 
-    // Spawn Reader Threads
     for (int r = 0; r < NUM_READERS; ++r) {
         threads.emplace_back([&, r]() {
             while (!start_flag.load(std::memory_order_acquire)) {
@@ -198,7 +304,6 @@ void test_concurrency_stress() {
                 total_reads.fetch_add(1, std::memory_order_relaxed);
                 if (val.has_value()) {
                     read_hits.fetch_add(1, std::memory_order_relaxed);
-                    // Verify data integrity: value must not be empty and must have expected prefix
                     assert(!val->empty());
                 } else {
                     read_misses.fetch_add(1, std::memory_order_relaxed);
@@ -220,7 +325,7 @@ void test_concurrency_stress() {
     uint64_t total_ops = total_reads.load() + total_writes.load() + total_deletes.load() + batch_commands_applied.load();
     double throughput = static_cast<double>(total_ops) / duration.count();
 
-    std::cout << "Concurrency Test Statistics:" << std::endl;
+    std::cout << "--- Concurrency Test Statistics ---" << std::endl;
     std::cout << "Threads:               " << NUM_READERS << " Readers, " << NUM_WRITERS << " Writers" << std::endl;
     std::cout << "Duration:              " << std::fixed << std::setprecision(4) << duration.count() << " seconds" << std::endl;
     std::cout << "Total Operations:      " << total_ops << std::endl;
@@ -241,6 +346,8 @@ int main() {
     try {
         test_basic_crud();
         test_state_machine_batching_and_snapshot();
+        test_wal_durability_and_recovery();
+        test_wal_corruption_and_truncation();
         test_concurrency_stress();
 
         std::cout << "=================================================" << std::endl;

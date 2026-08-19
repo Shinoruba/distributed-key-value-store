@@ -4,7 +4,7 @@
 - [x] Implement core `KeyValueStore` / `StorageEngine` class supporting `GET`, `SET`, `DEL`.
 - [x] Implement thread-safety via `std::shared_mutex` (reader-writer lock pattern).
 - [ ] Add TTL (Time-To-Live) expiration handling and periodic cleanup.
-- [ ] Add basic Write-Ahead Logging (WAL) for append-only crash recovery.
+- [x] Add basic Write-Ahead Logging (WAL) for append-only crash recovery.
 - [x] Write unit tests verifying concurrent read/write isolation.
 
 ### Phase 2: Standalone Asio Networking & Protocol

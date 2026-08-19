@@ -5,6 +5,8 @@ add_executable(DistributedKVStore
     "DistributedKVStore.h"
     "src/storage_engine.cpp"
     "include/storage_engine.hpp"
+    "src/wal.cpp"
+    "include/wal.hpp"
 )
 
 target_include_directories(DistributedKVStore PUBLIC
