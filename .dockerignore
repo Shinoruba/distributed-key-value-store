@@ -1,0 +1,10 @@
+build/
+out/
+.vs/
+.git/
+*.slnx
+*.suo
+*.user
+*.vsidx
+CMakeCache.txt
+CMakeFiles
