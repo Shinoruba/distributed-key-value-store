@@ -45,7 +45,12 @@ add_executable(kvstore-cli "src/cli_main.cpp")
 target_link_libraries(kvstore-cli PRIVATE kvstore_core)
 target_compile_features(kvstore-cli PRIVATE cxx_std_17)
 
-# 3. Test Suite Executable
+# 3. Benchmark Runner Executable
+add_executable(kvstore-bench "src/bench_main.cpp")
+target_link_libraries(kvstore-bench PRIVATE kvstore_core)
+target_compile_features(kvstore-bench PRIVATE cxx_std_17)
+
+# 4. Test Suite Executable
 add_executable(kvstore-tests "DistributedKVStore.cpp" "DistributedKVStore.h")
 target_link_libraries(kvstore-tests PRIVATE kvstore_core)
 target_compile_features(kvstore-tests PRIVATE cxx_std_17)

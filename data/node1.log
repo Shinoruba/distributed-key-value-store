@@ -1,0 +1,14 @@
+======================================================
+ DistributedKVStore Server Node                       
+======================================================
+Node ID:      node_1
+Host:         127.0.0.1
+Client Port:  6380
+Raft Port:    7080
+Peers:        node_2=127.0.0.1:7081,node_3=127.0.0.1:7082
+WAL Path:     C:\Users\Admin\Desktop\DistributedKVStore\data\node1.wal
+Workers:      12
+======================================================
+
+[WAL] Replayed 0 operations from log on startup.
+[Server] Ready and listening for client connections on 127.0.0.1:6380

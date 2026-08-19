@@ -15,71 +15,113 @@ cmake -B build -S .
 cmake --build build --config Release
 ```
 
-The build produces three standalone executables in `build/DistributedKVStore/Release/`:
-1. `kvstore-server.exe` — The cluster node server daemon.
-2. `kvstore-cli.exe` — Interactive CLI client REPL and one-shot utility.
-3. `kvstore-tests.exe` — Comprehensive automated test suite.
+The build produces four standalone executables in `build/DistributedKVStore/Release/`:
+1. **`kvstore-server.exe`** — The cluster node server daemon.
+2. **`kvstore-cli.exe`** — Interactive CLI client REPL and one-shot utility.
+3. **`kvstore-bench.exe`** — High-performance multi-threaded benchmark tool.
+4. **`kvstore-tests.exe`** — Comprehensive automated integration test suite.
 
 ---
 
-## Running the Cluster & CLI
+## Cluster Management Scripts
 
-### 1. Launch a 3-Node Local Cluster
-
-**Node 1 (Terminal 1):**
+### Start 3-Node Cluster
 ```powershell
-.\build\DistributedKVStore\Release\kvstore-server.exe --id node_1 --port 6379 --raft-port 7001 --peers "node_2=127.0.0.1:7002,node_3=127.0.0.1:7003" --wal "data/node1.wal"
+# Windows PowerShell
+.\scripts\start_cluster.ps1
+
+# Linux / macOS Bash
+./scripts/start_cluster.sh
 ```
 
-**Node 2 (Terminal 2):**
+### Stop Cluster
 ```powershell
-.\build\DistributedKVStore\Release\kvstore-server.exe --id node_2 --port 6380 --raft-port 7002 --peers "node_1=127.0.0.1:7001,node_3=127.0.0.1:7003" --wal "data/node2.wal"
-```
+# Windows PowerShell
+.\scripts\stop_cluster.ps1
 
-**Node 3 (Terminal 3):**
-```powershell
-.\build\DistributedKVStore\Release\kvstore-server.exe --id node_3 --port 6381 --raft-port 7003 --peers "node_1=127.0.0.1:7001,node_2=127.0.0.1:7002" --wal "data/node3.wal"
+# Linux / macOS Bash
+./scripts/stop_cluster.sh
 ```
 
 ---
 
-### 2. Interactive CLI Client
+## Interactive CLI Client
 
 Launch the interactive REPL:
 ```powershell
-.\build\DistributedKVStore\Release\kvstore-cli.exe --port 6379
+.\build\DistributedKVStore\Release\kvstore-cli.exe --port 6380
 ```
 
-#### Example CLI Session:
+#### Example Session:
 ```text
-127.0.0.1:6379> PING
-"PONG"  [120.4 µs]
+127.0.0.1:6380> PING
+"PONG"  [145.2 µs]
 
-127.0.0.1:6379> SET user:100 "Alice Smith"
-OK  [145.2 µs]
+127.0.0.1:6380> SET session:101 "user_token_abc" EX 60
+OK  [180.4 µs]
 
-127.0.0.1:6379> GET user:100
-"Alice Smith"  [110.1 µs]
+127.0.0.1:6380> TTL session:101
+(integer) 59420 ms (59s remaining)  [95.1 µs]
 
-127.0.0.1:6379> STATS
-"1"  [95.4 µs]
+127.0.0.1:6380> GET session:101
+"user_token_abc"  [110.3 µs]
 
-127.0.0.1:6379> DEL user:100
-OK  [138.6 µs]
+127.0.0.1:6380> STATS
+"1"  [85.6 µs]
 
-127.0.0.1:6379> GET user:100
-(nil)  [102.3 µs]
-```
-
-#### One-Shot Command Mode:
-```powershell
-.\build\DistributedKVStore\Release\kvstore-cli.exe --port 6379 SET mykey myvalue
-.\build\DistributedKVStore\Release\kvstore-cli.exe --port 6379 GET mykey
+127.0.0.1:6380> DEL session:101
+OK  [135.2 µs]
 ```
 
 ---
 
-### 3. Running Automated Tests
+## Benchmarking (`kvstore-bench`)
+
+Run the benchmark against a running cluster or node:
+```powershell
+.\build\DistributedKVStore\Release\kvstore-bench.exe --port 6380 --clients 16 --requests 50000 --ratio 1:4 --keyspace 10000
+```
+
+#### Sample Benchmark Output:
+```text
+======================================================
+ DistributedKVStore Benchmark Runner                  
+======================================================
+Target:        127.0.0.1:6380
+Clients:       16 threads
+Requests:      50000
+Keyspace:      10000 keys
+Workload:      1 SETs / 4 GETs (20.0% writes)
+Value Size:    64 bytes
+======================================================
+Connecting clients...
+Starting benchmark...
+
+======================================================
+ Benchmark Results                                    
+======================================================
+Total Duration:       0.5007 seconds
+Total Requests:       50000
+Throughput:           99866.96 ops/sec
+Successful Ops:       50000
+Redirects:            0
+Errors:               0
+------------------------------------------------------
+Latency Distribution:
+  Min:                39 µs
+  Avg:                124.5 µs
+  p50 (Median):       99 µs
+  p90:                145 µs
+  p95:                178 µs
+  p99:                338 µs
+  p99.9:              3370 µs
+  Max:                165692 µs
+======================================================
+```
+
+---
+
+## Running Automated Test Suite
 
 ```powershell
 .\build\DistributedKVStore\Release\kvstore-tests.exe

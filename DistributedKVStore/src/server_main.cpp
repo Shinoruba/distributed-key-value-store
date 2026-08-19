@@ -91,6 +91,7 @@ int main(int argc, char* argv[]) {
 
     try {
         asio::io_context ioc;
+        auto work_guard = asio::make_work_guard(ioc);
 
         std::shared_ptr<WAL> wal = nullptr;
         if (!wal_path.empty()) {
@@ -124,12 +125,14 @@ int main(int argc, char* argv[]) {
         sweep_timer.async_wait(run_sweep);
 
         asio::signal_set signals(ioc, SIGINT, SIGTERM);
-        signals.async_wait([&](const asio::error_code&, int sig) {
-            std::cout << "\n[Signal " << sig << " received] Initiating graceful shutdown..." << std::endl;
-            sweep_timer.cancel();
-            server.stop();
-            raft->stop();
-            ioc.stop();
+        signals.async_wait([&](const asio::error_code& ec, int sig) {
+            if (!ec) {
+                std::cout << "\n[Signal " << sig << " received] Initiating graceful shutdown..." << std::endl;
+                sweep_timer.cancel();
+                server.stop();
+                raft->stop();
+                ioc.stop();
+            }
         });
 
         std::vector<std::thread> threads;
