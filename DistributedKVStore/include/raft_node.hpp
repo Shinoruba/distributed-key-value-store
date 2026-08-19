@@ -40,9 +40,12 @@ public:
     NodeId node_id() const;
     NodeId leader_id() const;
     uint16_t port() const;
+    size_t in_memory_log_size() const;
     size_t log_size() const;
+    LogIndex last_log_index() const;
     LogIndex commit_index() const;
     LogIndex last_applied() const;
+    LogIndex last_included_index() const;
     bool is_running() const noexcept;
 
     void propose(const Command& cmd,
@@ -51,8 +54,11 @@ public:
     bool propose(const Command& cmd,
                  std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
 
+    bool take_snapshot(LogIndex up_to_index);
+
     RequestVoteReply handle_request_vote(const RequestVoteArgs& args);
     AppendEntriesReply handle_append_entries(const AppendEntriesArgs& args);
+    InstallSnapshotReply handle_install_snapshot(const InstallSnapshotArgs& args);
 
 private:
     void do_accept();
@@ -65,6 +71,8 @@ private:
     void replicate_to_peer(const PeerConfig& peer);
     void check_and_advance_commit_index();
     void apply_entries_to_state_machine();
+
+    Term get_log_term(LogIndex index) const;
 
     void send_rpc_async(const PeerConfig& peer, std::vector<uint8_t> payload,
                         std::function<void(const std::vector<uint8_t>&, const asio::error_code&)> callback);
@@ -84,6 +92,9 @@ private:
     NodeId voted_for_;
     NodeId current_leader_id_;
     std::vector<LogEntry> log_;
+
+    LogIndex last_included_index_{0};
+    Term last_included_term_{0};
 
     LogIndex commit_index_{0};
     LogIndex last_applied_{0};

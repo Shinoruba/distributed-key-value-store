@@ -1,5 +1,6 @@
 #include "raft_node.hpp"
 #include "storage_engine.hpp"
+#include "wal.hpp"
 
 #include <chrono>
 
@@ -90,8 +91,16 @@ uint16_t RaftNode::port() const {
     return port_;
 }
 
-size_t RaftNode::log_size() const {
+size_t RaftNode::in_memory_log_size() const {
     return log_.size() > 0 ? log_.size() - 1 : 0;
+}
+
+size_t RaftNode::log_size() const {
+    return in_memory_log_size();
+}
+
+LogIndex RaftNode::last_log_index() const {
+    return last_included_index_ + (log_.empty() ? 0 : static_cast<LogIndex>(log_.size() - 1));
 }
 
 LogIndex RaftNode::commit_index() const {
@@ -102,8 +111,60 @@ LogIndex RaftNode::last_applied() const {
     return last_applied_;
 }
 
+LogIndex RaftNode::last_included_index() const {
+    return last_included_index_;
+}
+
 bool RaftNode::is_running() const noexcept {
     return running_.load();
+}
+
+Term RaftNode::get_log_term(LogIndex index) const {
+    if (index == last_included_index_) {
+        return last_included_term_;
+    }
+    if (index > last_included_index_ && (index - last_included_index_) < log_.size()) {
+        return log_[index - last_included_index_].term;
+    }
+    return 0;
+}
+
+bool RaftNode::take_snapshot(LogIndex up_to_index) {
+    auto prom = std::make_shared<std::promise<bool>>();
+    auto fut = prom->get_future();
+
+    asio::post(strand_, [this, self = shared_from_this(), up_to_index, prom]() {
+        if (up_to_index <= last_included_index_ || up_to_index > commit_index_) {
+            prom->set_value(false);
+            return;
+        }
+
+        const size_t offset = static_cast<size_t>(up_to_index - last_included_index_);
+        if (offset >= log_.size()) {
+            prom->set_value(false);
+            return;
+        }
+
+        const Term snap_term = log_[offset].term;
+        std::vector<LogEntry> new_log;
+        new_log.push_back({snap_term, up_to_index, Command::make_noop()});
+
+        for (size_t i = offset + 1; i < log_.size(); ++i) {
+            new_log.push_back(std::move(log_[i]));
+        }
+
+        log_ = std::move(new_log);
+        last_included_index_ = up_to_index;
+        last_included_term_ = snap_term;
+
+        if (auto wal_ptr = engine_.wal()) {
+            wal_ptr->truncate();
+        }
+
+        prom->set_value(true);
+    });
+
+    return fut.get();
 }
 
 void RaftNode::propose(const Command& cmd,
@@ -114,7 +175,7 @@ void RaftNode::propose(const Command& cmd,
             return;
         }
 
-        const LogIndex new_index = static_cast<LogIndex>(log_.size());
+        const LogIndex new_index = last_log_index() + 1;
         LogEntry entry{current_term_, new_index, cmd};
         log_.push_back(std::move(entry));
         pending_callbacks_[new_index].push_back(std::move(callback));
@@ -191,7 +252,7 @@ void RaftNode::become_leader() {
 
     next_index_.clear();
     match_index_.clear();
-    const LogIndex last_idx = log_.empty() ? 0 : static_cast<LogIndex>(log_.size() - 1);
+    const LogIndex last_idx = last_log_index();
     for (const auto& peer : peers_) {
         next_index_[peer.id] = last_idx + 1;
         match_index_[peer.id] = 0;
@@ -223,8 +284,8 @@ void RaftNode::broadcast_request_vote() {
     RequestVoteArgs args;
     args.term = current_term_;
     args.candidate_id = node_id_;
-    args.last_log_index = log_.empty() ? 0 : log_.back().index;
-    args.last_log_term = log_.empty() ? 0 : log_.back().term;
+    args.last_log_index = last_log_index();
+    args.last_log_term = get_log_term(args.last_log_index);
 
     auto payload = RaftRpcSerializer::serialize_request_vote_args(args);
     const size_t quorum = ((peers_.size() + 1) / 2) + 1;
@@ -260,10 +321,42 @@ void RaftNode::replicate_to_peer(const PeerConfig& peer) {
 
     LogIndex p_next = next_index_[peer.id];
     if (p_next == 0) p_next = 1;
-    if (p_next > log_.size()) p_next = static_cast<LogIndex>(log_.size());
+
+    if (p_next <= last_included_index_) {
+        InstallSnapshotArgs snap_args;
+        snap_args.term = current_term_;
+        snap_args.leader_id = node_id_;
+        snap_args.last_included_index = last_included_index_;
+        snap_args.last_included_term = last_included_term_;
+        snap_args.data = engine_.snapshot();
+
+        auto payload = RaftRpcSerializer::serialize_install_snapshot_args(snap_args);
+        const Term req_term = current_term_;
+        const LogIndex snap_idx = last_included_index_;
+
+        send_rpc_async(peer, payload, [this, self = shared_from_this(), peer_id = peer.id, req_term, snap_idx](const std::vector<uint8_t>& resp_data, const asio::error_code& ec) {
+            if (ec || !running_ || role_ != NodeRole::LEADER || current_term_ != req_term) {
+                return;
+            }
+
+            if (resp_data.size() <= sizeof(uint32_t)) return;
+            auto reply = RaftRpcSerializer::deserialize_install_snapshot_reply(resp_data.data() + sizeof(uint32_t), resp_data.size() - sizeof(uint32_t));
+            if (!reply) return;
+
+            if (reply->term > current_term_) {
+                become_follower(reply->term);
+                return;
+            }
+
+            match_index_[peer_id] = std::max(match_index_[peer_id], snap_idx);
+            next_index_[peer_id] = match_index_[peer_id] + 1;
+            check_and_advance_commit_index();
+        });
+        return;
+    }
 
     const LogIndex prev_idx = p_next - 1;
-    const Term prev_term = log_[prev_idx].term;
+    const Term prev_term = get_log_term(prev_idx);
 
     AppendEntriesArgs args;
     args.term = current_term_;
@@ -272,7 +365,8 @@ void RaftNode::replicate_to_peer(const PeerConfig& peer) {
     args.prev_log_term = prev_term;
     args.leader_commit = commit_index_;
 
-    for (size_t i = p_next; i < log_.size(); ++i) {
+    const size_t start_offset = static_cast<size_t>(p_next - last_included_index_);
+    for (size_t i = start_offset; i < log_.size(); ++i) {
         args.entries.push_back(log_[i]);
     }
 
@@ -329,8 +423,9 @@ void RaftNode::broadcast_heartbeats() {
 void RaftNode::check_and_advance_commit_index() {
     if (role_ != NodeRole::LEADER) return;
 
-    for (LogIndex n = log_.size() - 1; n > commit_index_; --n) {
-        if (log_[n].term != current_term_) continue;
+    const LogIndex last_idx = last_log_index();
+    for (LogIndex n = last_idx; n > commit_index_; --n) {
+        if (get_log_term(n) != current_term_) continue;
 
         size_t count = 1;
         for (const auto& peer : peers_) {
@@ -351,16 +446,19 @@ void RaftNode::check_and_advance_commit_index() {
 void RaftNode::apply_entries_to_state_machine() {
     while (commit_index_ > last_applied_) {
         ++last_applied_;
-        if (last_applied_ < log_.size()) {
-            const auto& entry = log_[last_applied_];
-            engine_.apply(entry.command);
+        if (last_applied_ > last_included_index_) {
+            const size_t offset = static_cast<size_t>(last_applied_ - last_included_index_);
+            if (offset < log_.size()) {
+                const auto& entry = log_[offset];
+                engine_.apply(entry.command);
 
-            auto it = pending_callbacks_.find(last_applied_);
-            if (it != pending_callbacks_.end()) {
-                for (auto& cb : it->second) {
-                    cb(true, node_id_);
+                auto it = pending_callbacks_.find(last_applied_);
+                if (it != pending_callbacks_.end()) {
+                    for (auto& cb : it->second) {
+                        cb(true, node_id_);
+                    }
+                    pending_callbacks_.erase(it);
                 }
-                pending_callbacks_.erase(it);
             }
         }
     }
@@ -375,8 +473,8 @@ RequestVoteReply RaftNode::handle_request_vote(const RequestVoteArgs& args) {
         become_follower(args.term);
     }
 
-    const Term last_term = log_.empty() ? 0 : log_.back().term;
-    const LogIndex last_idx = log_.empty() ? 0 : log_.back().index;
+    const LogIndex last_idx = last_log_index();
+    const Term last_term = get_log_term(last_idx);
     const bool log_ok = (args.last_log_term > last_term) ||
                         (args.last_log_term == last_term && args.last_log_index >= last_idx);
 
@@ -401,20 +499,28 @@ AppendEntriesReply RaftNode::handle_append_entries(const AppendEntriesArgs& args
         reset_election_timeout();
     }
 
-    if (args.prev_log_index >= log_.size()) {
-        return {current_term_, false, log_.empty() ? 0 : static_cast<LogIndex>(log_.size() - 1)};
+    if (args.prev_log_index < last_included_index_) {
+        return {current_term_, false, last_log_index()};
     }
 
-    if (log_[args.prev_log_index].term != args.prev_log_term) {
-        log_.resize(args.prev_log_index);
-        return {current_term_, false, log_.empty() ? 0 : static_cast<LogIndex>(log_.size() - 1)};
+    if (args.prev_log_index > last_log_index()) {
+        return {current_term_, false, last_log_index()};
+    }
+
+    if (get_log_term(args.prev_log_index) != args.prev_log_term) {
+        if (args.prev_log_index > last_included_index_) {
+            const size_t cut_offset = static_cast<size_t>(args.prev_log_index - last_included_index_);
+            log_.resize(cut_offset);
+        }
+        return {current_term_, false, last_log_index()};
     }
 
     LogIndex insert_idx = args.prev_log_index + 1;
     for (const auto& entry : args.entries) {
-        if (insert_idx < log_.size()) {
-            if (log_[insert_idx].term != entry.term) {
-                log_.resize(insert_idx);
+        if (insert_idx <= last_log_index()) {
+            const size_t offset = static_cast<size_t>(insert_idx - last_included_index_);
+            if (offset < log_.size() && log_[offset].term != entry.term) {
+                log_.resize(offset);
                 log_.push_back(entry);
             }
         } else {
@@ -424,11 +530,44 @@ AppendEntriesReply RaftNode::handle_append_entries(const AppendEntriesArgs& args
     }
 
     if (args.leader_commit > commit_index_) {
-        commit_index_ = std::min(args.leader_commit, static_cast<LogIndex>(log_.size() - 1));
+        commit_index_ = std::min(args.leader_commit, last_log_index());
         apply_entries_to_state_machine();
     }
 
-    return {current_term_, true, static_cast<LogIndex>(log_.size() - 1)};
+    return {current_term_, true, last_log_index()};
+}
+
+InstallSnapshotReply RaftNode::handle_install_snapshot(const InstallSnapshotArgs& args) {
+    if (args.term < current_term_) {
+        return {current_term_};
+    }
+
+    if (args.term > current_term_ || role_ != NodeRole::FOLLOWER) {
+        become_follower(args.term, args.leader_id);
+    } else {
+        current_leader_id_ = args.leader_id;
+        reset_election_timeout();
+    }
+
+    if (args.last_included_index <= last_included_index_) {
+        return {current_term_};
+    }
+
+    engine_.restore_snapshot(args.data);
+    last_included_index_ = args.last_included_index;
+    last_included_term_ = args.last_included_term;
+
+    log_.clear();
+    log_.push_back({last_included_term_, last_included_index_, Command::make_noop()});
+
+    commit_index_ = std::max(commit_index_, last_included_index_);
+    last_applied_ = std::max(last_applied_, last_included_index_);
+
+    if (auto wal_ptr = engine_.wal()) {
+        wal_ptr->truncate();
+    }
+
+    return {current_term_};
 }
 
 void RaftNode::do_accept() {
@@ -460,6 +599,12 @@ void RaftNode::do_accept() {
                                 if (args) {
                                     auto reply = handle_append_entries(*args);
                                     resp = RaftRpcSerializer::serialize_append_entries_reply(reply);
+                                }
+                            } else if (type == static_cast<uint8_t>(RaftRpcType::INSTALL_SNAPSHOT_REQ)) {
+                                auto args = RaftRpcSerializer::deserialize_install_snapshot_args(payload->data(), payload->size());
+                                if (args) {
+                                    auto reply = handle_install_snapshot(*args);
+                                    resp = RaftRpcSerializer::serialize_install_snapshot_reply(reply);
                                 }
                             }
 

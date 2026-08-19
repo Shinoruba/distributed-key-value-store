@@ -1,12 +1,15 @@
 #include "tcp_session.hpp"
 #include "storage_engine.hpp"
+#include "raft_node.hpp"
 
 namespace distributed_kv {
 
-TcpSession::TcpSession(asio::ip::tcp::socket socket, StorageEngine& engine)
+TcpSession::TcpSession(asio::ip::tcp::socket socket, StorageEngine& engine,
+                       std::shared_ptr<RaftNode> raft)
     : socket_(std::move(socket)),
       strand_(asio::make_strand(socket_.get_executor())),
-      engine_(engine) {}
+      engine_(engine),
+      raft_(std::move(raft)) {}
 
 void TcpSession::start() {
     read_header();
@@ -24,7 +27,7 @@ void TcpSession::read_header() {
     asio::async_read(
         socket_,
         asio::buffer(&read_payload_len_, sizeof(uint32_t)),
-        asio::bind_executor(strand_, [this, self](const asio::error_code& ec, size_t /*length*/) {
+        asio::bind_executor(strand_, [this, self](const asio::error_code& ec, size_t) {
             if (ec) {
                 return;
             }
@@ -46,7 +49,7 @@ void TcpSession::read_payload(uint32_t payload_len) {
     asio::async_read(
         socket_,
         asio::buffer(read_buffer_.data(), payload_len),
-        asio::bind_executor(strand_, [this, self](const asio::error_code& ec, size_t /*length*/) {
+        asio::bind_executor(strand_, [this, self](const asio::error_code& ec, size_t) {
             if (ec) {
                 return;
             }
@@ -64,14 +67,29 @@ void TcpSession::read_payload(uint32_t payload_len) {
 }
 
 void TcpSession::handle_request(const Request& req) {
+    auto self = shared_from_this();
     switch (req.op) {
         case OpCode::PING:
             queue_response(Response::ok("PONG", "PONG"));
             break;
 
         case OpCode::SET:
-            engine_.set(req.key, req.value);
-            queue_response(Response::ok("", "OK"));
+            if (raft_) {
+                if (!raft_->is_leader()) {
+                    queue_response(Response::error("NOT_LEADER:" + raft_->leader_id()));
+                    return;
+                }
+                raft_->propose(Command::make_set(req.key, req.value), [self](bool ok, std::string leader_id) {
+                    if (ok) {
+                        self->queue_response(Response::ok("", "OK"));
+                    } else {
+                        self->queue_response(Response::error("NOT_LEADER:" + leader_id));
+                    }
+                });
+            } else {
+                engine_.set(req.key, req.value);
+                queue_response(Response::ok("", "OK"));
+            }
             break;
 
         case OpCode::GET: {
@@ -85,10 +103,24 @@ void TcpSession::handle_request(const Request& req) {
         }
 
         case OpCode::DEL: {
-            if (engine_.del(req.key)) {
-                queue_response(Response::ok("", "OK"));
+            if (raft_) {
+                if (!raft_->is_leader()) {
+                    queue_response(Response::error("NOT_LEADER:" + raft_->leader_id()));
+                    return;
+                }
+                raft_->propose(Command::make_del(req.key), [self](bool ok, std::string leader_id) {
+                    if (ok) {
+                        self->queue_response(Response::ok("", "OK"));
+                    } else {
+                        self->queue_response(Response::error("NOT_LEADER:" + leader_id));
+                    }
+                });
             } else {
-                queue_response(Response::not_found("Key not found"));
+                if (engine_.del(req.key)) {
+                    queue_response(Response::ok("", "OK"));
+                } else {
+                    queue_response(Response::not_found("Key not found"));
+                }
             }
             break;
         }
@@ -120,7 +152,7 @@ void TcpSession::do_write() {
     asio::async_write(
         socket_,
         asio::buffer(write_queue_.front()),
-        asio::bind_executor(strand_, [this, self](const asio::error_code& ec, size_t /*length*/) {
+        asio::bind_executor(strand_, [this, self](const asio::error_code& ec, size_t) {
             if (ec) {
                 stop();
                 return;

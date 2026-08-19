@@ -10,10 +10,12 @@
 namespace distributed_kv {
 
 class StorageEngine;
+class RaftNode;
 
 class TcpSession : public std::enable_shared_from_this<TcpSession> {
 public:
-    TcpSession(asio::ip::tcp::socket socket, StorageEngine& engine);
+    TcpSession(asio::ip::tcp::socket socket, StorageEngine& engine,
+               std::shared_ptr<RaftNode> raft = nullptr);
     ~TcpSession() = default;
 
     TcpSession(const TcpSession&) = delete;
@@ -32,6 +34,7 @@ private:
     asio::ip::tcp::socket socket_;
     asio::strand<asio::any_io_executor> strand_;
     StorageEngine& engine_;
+    std::shared_ptr<RaftNode> raft_;
 
     uint32_t read_payload_len_{0};
     std::vector<uint8_t> read_buffer_;

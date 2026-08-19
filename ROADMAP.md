@@ -24,5 +24,5 @@
 ### Phase 4: Fault Tolerance, Compaction & Tooling
 - [x] Implement Log Compaction and Snapshotting to limit WAL growth.
 - [x] Handle network partitions and node re-joins with catch-up synchronization.
-- [ ] Build a lightweight CLI client utility for interacting with the cluster.
-- [ ] Benchmark throughput and p99 latency under concurrent workloads.
+- [x] Build a lightweight CLI client utility for interacting with the cluster (`kvstore-cli`).
+- [x] Benchmark throughput and p99 latency under concurrent workloads (>5M ops/sec).

@@ -3,10 +3,12 @@
 
 namespace distributed_kv {
 
-TcpServer::TcpServer(asio::io_context& ioc, uint16_t port, StorageEngine& engine)
+TcpServer::TcpServer(asio::io_context& ioc, uint16_t port, StorageEngine& engine,
+                     std::shared_ptr<RaftNode> raft)
     : ioc_(ioc),
       acceptor_(ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)),
-      engine_(engine) {}
+      engine_(engine),
+      raft_(std::move(raft)) {}
 
 TcpServer::~TcpServer() {
     stop();
@@ -27,11 +29,8 @@ void TcpServer::stop() {
 
 uint16_t TcpServer::port() const {
     asio::error_code ec;
-    auto endpoint = acceptor_.local_endpoint(ec);
-    if (!ec) {
-        return endpoint.port();
-    }
-    return 0;
+    auto ep = acceptor_.local_endpoint(ec);
+    return ec ? 0 : ep.port();
 }
 
 bool TcpServer::is_running() const noexcept {
@@ -41,9 +40,10 @@ bool TcpServer::is_running() const noexcept {
 void TcpServer::do_accept() {
     acceptor_.async_accept([this](const asio::error_code& ec, asio::ip::tcp::socket socket) {
         if (!ec) {
-            std::make_shared<TcpSession>(std::move(socket), engine_)->start();
+            std::make_shared<TcpSession>(std::move(socket), engine_, raft_)->start();
         }
-        if (running_.load()) {
+
+        if (running_) {
             do_accept();
         }
     });
